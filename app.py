@@ -1,44 +1,14 @@
-import streamlit as st
-import pandas as pd
-import xml.etree.ElementTree as ET
-from xml.dom import minidom # Fallback dla Pythona < 3.9
-import io
-import zipfile
-import re
-import unicodedata
-import hashlib
-import time
-from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-
-# --- KONFIGURACJA BIZNESOWA ---
-MAX_ZAD_LEN = 23
-MAX_OPIS_LEN = 1500
-WARN_AMOUNT_THRESHOLD = 1_000_000_000      # 1 miliard złotych
-ERROR_AMOUNT_THRESHOLD = 100_000_000_000   # 100 miliardów złotych
-
-# Globalna kompilacja regexu XML
-XML_CLEAN_RE = re.compile(r'[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]')
-
-# --- FUNKCJE POMOCNICZE ---
-
-def sanitize_xml(text, context=None, stats=None):
-    if pd.isna(text) or text is None:
-        return ""
-    orig_text = str(text)
-    orig_len = len(orig_text)
-    cleaned_text = XML_CLEAN_RE.sub('', orig_text)
-    if stats is not None and orig_len != len(cleaned_text):
-        stats['sanitized_chars'] += (orig_len - len(cleaned_text))
-        if context: stats['sanitized_details'].add(context)
-    return cleaned_text
-
 def clean_id(value, length=None, strict_mode=True):
     """Czyszczenie identyfikatorów - wyciąga tylko cyfry z komórki."""
     if pd.isna(value): return None
     
-    # Usuwamy wszystko, co nie jest cyfrą (zostają tylko liczby np. Dział 801 -> 801)
-    val_str = re.sub(r'[^\d]', '', str(value))
+    # NOWE: Konwersja do tekstu i bezpieczne usunięcie ".0" po ułamkach Pandasa
+    val_str = str(value).strip()
+    if val_str.endswith('.0'):
+        val_str = val_str[:-2]
+        
+    # Usuwamy wszystko, co nie jest cyfrą (np. z "Dział 801" zostaje "801")
+    val_str = re.sub(r'[^\d]', '', val_str)
     
     try:
         if length and len(val_str) > length:
