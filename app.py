@@ -139,8 +139,14 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         df_sorted['Sposob_finansowania'] = 'WG'
     
-    df_sorted['Zad_Sys'] = df_sorted['Zadanie'].astype(str).str.strip().apply(lambda x: mapping_dict.get(x, x))
-    df_sorted.loc[df_sorted['Zad_Sys'].isin(['nan', '', 'None']), 'Zad_Sys'] = "000000000"
+# Bezpieczne pobranie kolumny Zadanie i wymuszenie typu tekstowego (str)
+    if 'Zadanie' in df_sorted.columns:
+        df_sorted['Zad_Sys'] = df_sorted['Zadanie'].fillna('').astype(str).str.strip()
+        df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: str(mapping_dict.get(x, x)))
+        df_sorted.loc[df_sorted['Zad_Sys'].isin(['nan', '', 'None']), 'Zad_Sys'] = "000000000"
+    else:
+        df_sorted['Zad_Sys'] = "000000000"
+        
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
     
     group_cols = ['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean', 'Sposob_finansowania', 'Zad_Sys']
