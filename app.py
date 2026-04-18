@@ -37,13 +37,11 @@ def clean_id(value, length=None, strict_mode=True):
     """Czyszczenie identyfikatorów - wyciąga tylko cyfry z komórki."""
     if pd.isna(value): return None
     
-    # Usuwamy wszystko, co nie jest cyfrą (zostają tylko liczby)
+    # Usuwamy wszystko, co nie jest cyfrą (zostają tylko liczby np. Dział 801 -> 801)
     val_str = re.sub(r'[^\d]', '', str(value))
     
     try:
-        # Jeśli zdefiniowano długość (np. 3 dla Działu), a mamy za długi ciąg
         if length and len(val_str) > length:
-            # Bierzemy tylko ostatnie N znaków (jeśli to potrzebne)
             val_str = val_str[-length:]
             
         if val_str.isdigit(): 
@@ -133,10 +131,11 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     df_sorted = data_frame.copy()
     stats['audit_before'] += len(df_sorted)
     
-    if 'Fundusz' in df_sorted.columns:
-        df_sorted['Sposob_finansowania'] = df_sorted['Fundusz'].fillna('WG')
-    elif 'Sposób finansowania' in df_sorted.columns:
+    # Priorytetowe użycie kolumny 'Sposób finansowania'
+    if 'Sposób finansowania' in df_sorted.columns:
         df_sorted['Sposob_finansowania'] = df_sorted['Sposób finansowania'].fillna('WG')
+    elif 'Fundusz' in df_sorted.columns:
+        df_sorted['Sposob_finansowania'] = df_sorted['Fundusz'].fillna('WG')
     else:
         df_sorted['Sposob_finansowania'] = 'WG'
     
@@ -253,7 +252,6 @@ if f:
     try:
         df = pd.read_excel(f, sheet_name='Zmiany')
         df.columns = df.columns.str.strip()
-        col_p = '§' if '§' in df.columns else 'Paragraf'
         
         type_map = {
             'dochody': 'Dochody', 'dochód': 'Dochody', 'doch': 'Dochody', 'd': 'Dochody', 'dw': 'Dochody',
@@ -262,11 +260,25 @@ if f:
         cleaned_typ = df['Typ D/W'].astype(str).str.lower().str.replace(r'[^a-ząćęłńóśżź]', '', regex=True)
         df['Typ_DW_norm'] = cleaned_typ.map(type_map).fillna("BŁĄD")
         
-        df['Dzial_clean'] = df['Dział'].apply(lambda x: clean_id(x, 3, strict_mode))
+        # --- MAPOWANIE ZGODNE Z WYTYCZNYMI Z EXCELA ---
+        # Rozdział - Kolumna C (Rozdział)
         df['Rozdzial_clean'] = df['Rozdział'].apply(lambda x: clean_id(x, 5, strict_mode))
-        df['Paragraf_clean'] = df[col_p].apply(lambda x: clean_id(x, 4, strict_mode))
+        
+        # Dział - Kolumna H (Dział). Funkcja clean_id automatycznie usunie słowo "Dział" i zostawi np. "801".
+        # Jako zabezpieczenie: jeśli komórka Dział była pusta, pobieramy pierwsze 3 cyfry z Rozdziału.
+        dzial_z_kolumny = df['Dział'].apply(lambda x: clean_id(x, 3, strict_mode))
+        df['Dzial_clean'] = dzial_z_kolumny.fillna(df['Rozdzial_clean'].str[:3])
+        
+        # Paragraf - Kolumna D (§)
+        df['Paragraf_clean'] = df['§'].apply(lambda x: clean_id(x, 4, strict_mode))
+        
+        # Plan - Kolumna K (Zmiana)
         df['Zmiana_num'] = df['Zmiana'].apply(lambda x: parse_kwota(x, strict_mode)).astype(pd.Int64Dtype())
+        
+        # Dysponent - Kolumna E (Jednostka) 
+        # (później tłumaczona w xml builder przez mapping_dict)
         df['Jednostka_clean'] = df['Jednostka'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True)
+        # ----------------------------------------------
         
         errors = []
         df_valid = df[df['Jednostka_clean'].notna() & (df['Jednostka_clean'] != '') & (df['Jednostka_clean'] != 'nan')].copy()
