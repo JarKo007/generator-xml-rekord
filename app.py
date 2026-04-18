@@ -316,7 +316,7 @@ if f:
             st.stop()
 
         bilans_grosze = pd.to_numeric(df_valid['Zmiana_num'], errors='coerce').dropna().astype('int64').sum()
-        bilans_zl = Decimal(bilans_grosze) / 100
+        bilans_zl = Decimal(int(bilans_grosze)) / 100
         
         units = sorted(df_valid['Jednostka_clean'].unique())
         z_buf, used_names = io.BytesIO(), set()
