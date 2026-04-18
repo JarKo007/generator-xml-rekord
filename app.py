@@ -1,13 +1,48 @@
+import streamlit as st
+import pandas as pd
+import xml.etree.ElementTree as ET
+from xml.dom import minidom # Fallback dla Pythona < 3.9
+import io
+import zipfile
+import re
+import unicodedata
+import hashlib
+import time
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+
+# --- KONFIGURACJA BIZNESOWA ---
+MAX_ZAD_LEN = 23
+MAX_OPIS_LEN = 1500
+WARN_AMOUNT_THRESHOLD = 1_000_000_000      # 1 miliard złotych
+ERROR_AMOUNT_THRESHOLD = 100_000_000_000   # 100 miliardów złotych
+
+# Globalna kompilacja regexu XML
+XML_CLEAN_RE = re.compile(r'[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]')
+
+# --- FUNKCJE POMOCNICZE ---
+
+def sanitize_xml(text, context=None, stats=None):
+    if pd.isna(text) or text is None:
+        return ""
+    orig_text = str(text)
+    orig_len = len(orig_text)
+    cleaned_text = XML_CLEAN_RE.sub('', orig_text)
+    if stats is not None and orig_len != len(cleaned_text):
+        stats['sanitized_chars'] += (orig_len - len(cleaned_text))
+        if context: stats['sanitized_details'].add(context)
+    return cleaned_text
+
 def clean_id(value, length=None, strict_mode=True):
     """Czyszczenie identyfikatorów - wyciąga tylko cyfry z komórki."""
     if pd.isna(value): return None
     
-    # NOWE: Konwersja do tekstu i bezpieczne usunięcie ".0" po ułamkach Pandasa
+    # Konwersja do tekstu i bezpieczne usunięcie ".0" po ułamkach Pandasa
     val_str = str(value).strip()
     if val_str.endswith('.0'):
         val_str = val_str[:-2]
         
-    # Usuwamy wszystko, co nie jest cyfrą (np. z "Dział 801" zostaje "801")
+    # Usuwamy wszystko, co nie jest cyfrą
     val_str = re.sub(r'[^\d]', '', val_str)
     
     try:
@@ -101,7 +136,6 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     df_sorted = data_frame.copy()
     stats['audit_before'] += len(df_sorted)
     
-    # Priorytetowe użycie kolumny 'Sposób finansowania'
     if 'Sposób finansowania' in df_sorted.columns:
         df_sorted['Sposob_finansowania'] = df_sorted['Sposób finansowania'].fillna('WG')
     elif 'Fundusz' in df_sorted.columns:
@@ -109,7 +143,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         df_sorted['Sposob_finansowania'] = 'WG'
     
-# Bezpieczne pobranie kolumny Zadanie i wymuszenie typu tekstowego (str)
+    # Bezpieczne parsowanie kolumny Zadanie
     if 'Zadanie' in df_sorted.columns:
         df_sorted['Zad_Sys'] = df_sorted['Zadanie'].fillna('').astype(str).str.strip()
         df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: str(mapping_dict.get(x, x)))
@@ -196,7 +230,6 @@ d_opis = st.sidebar.text_input("Uzasadnienie (fallback)", "Zmiana planu")
 
 st.sidebar.header("⚙️ Ustawienia Księgowe")
 
-# --- UX WIDGET: Jasne opisy Typu Zmiany ---
 opcje_typu_zmiany = {
     "10 (domyślnie) - uchwała/zarządzenie": "10",
     "0 - plan początkowy": "0"
@@ -208,7 +241,6 @@ wybrana_etykieta_zmiany = st.sidebar.selectbox(
     help="Zdecyduj o charakterze prawnym importu do systemu Rekord."
 )
 typ_zmiany_opcja = opcje_typu_zmiany[wybrana_etykieta_zmiany]
-# ------------------------------------------
 
 strict_mode = st.sidebar.checkbox("Restrykcyjna walidacja danych", value=True, help="Zaznaczone: Odrzuca dziwne ułamki i nadmiarowe przecinki. Odznaczone: Próbuje zgadywać i naprawiać.")
 audit_mode = st.sidebar.checkbox("Tryb Audytu (Analiza Danych)", value=False, help="Wyświetla szczegółowe informacje m.in. o zsumowanych wierszach na identycznej klasyfikacji.")
@@ -236,25 +268,14 @@ if f:
         cleaned_typ = df['Typ D/W'].astype(str).str.lower().str.replace(r'[^a-ząćęłńóśżź]', '', regex=True)
         df['Typ_DW_norm'] = cleaned_typ.map(type_map).fillna("BŁĄD")
         
-        # --- MAPOWANIE ZGODNE Z WYTYCZNYMI Z EXCELA ---
-        # Rozdział - Kolumna C (Rozdział)
         df['Rozdzial_clean'] = df['Rozdział'].apply(lambda x: clean_id(x, 5, strict_mode))
         
-        # Dział - Kolumna H (Dział). Funkcja clean_id automatycznie usunie słowo "Dział" i zostawi np. "801".
-        # Jako zabezpieczenie: jeśli komórka Dział była pusta, pobieramy pierwsze 3 cyfry z Rozdziału.
         dzial_z_kolumny = df['Dział'].apply(lambda x: clean_id(x, 3, strict_mode))
         df['Dzial_clean'] = dzial_z_kolumny.fillna(df['Rozdzial_clean'].str[:3])
         
-        # Paragraf - Kolumna D (§)
         df['Paragraf_clean'] = df['§'].apply(lambda x: clean_id(x, 4, strict_mode))
-        
-        # Plan - Kolumna K (Zmiana)
         df['Zmiana_num'] = df['Zmiana'].apply(lambda x: parse_kwota(x, strict_mode)).astype(pd.Int64Dtype())
-        
-        # Dysponent - Kolumna E (Jednostka) 
-        # (później tłumaczona w xml builder przez mapping_dict)
         df['Jednostka_clean'] = df['Jednostka'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True)
-        # ----------------------------------------------
         
         errors = []
         df_valid = df[df['Jednostka_clean'].notna() & (df['Jednostka_clean'] != '') & (df['Jednostka_clean'] != 'nan')].copy()
