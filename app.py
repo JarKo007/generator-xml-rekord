@@ -34,20 +34,22 @@ def sanitize_xml(text, context=None, stats=None):
     return cleaned_text
 
 def clean_id(value, length=None, strict_mode=True):
+    """Czyszczenie identyfikatorów - wyciąga tylko cyfry z komórki."""
     if pd.isna(value): return None
-    val_str = str(value).strip().replace('§', '')
-    if ',' in val_str or val_str.count('.') > 1: 
-        if strict_mode: return None
-        else: val_str = val_str.replace('.', '').replace(',', '')
-    val_str = re.sub(r'\.0+$', '', val_str)
+    
+    # Usuwamy wszystko, co nie jest cyfrą (zostają tylko liczby)
+    val_str = re.sub(r'[^\d]', '', str(value))
+    
     try:
-        val_float = float(val_str)
-        if val_float.is_integer():
-            val_int = int(val_float)
-            return str(val_int).zfill(length) if length else str(val_int)
+        # Jeśli zdefiniowano długość (np. 3 dla Działu), a mamy za długi ciąg
+        if length and len(val_str) > length:
+            # Bierzemy tylko ostatnie N znaków (jeśli to potrzebne)
+            val_str = val_str[-length:]
+            
+        if val_str.isdigit(): 
+            return val_str.zfill(length) if length else val_str
         return None
-    except ValueError:
-        if val_str.isdigit(): return val_str.zfill(length) if length else val_str
+    except Exception:
         return None
 
 def parse_kwota(val, strict_mode=True):
