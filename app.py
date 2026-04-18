@@ -114,8 +114,9 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     typ_xml_node = ET.SubElement(root, typ_str)
     
     if 'Uzasadnienie' in data_frame.columns:
-        uzas_list = data_frame['Uzasadnienie'].astype(str).str.strip()
-        valid_uzas = [u for u in uzas_list.unique() if u.lower() not in ['nan', 'none', '']]
+        # Dodajemy fillna('') i wymuszamy str() na każdym elemencie, żeby zabić "floata"
+        uzas_list = data_frame['Uzasadnienie'].fillna('').astype(str).str.strip()
+        valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
         uzasadnienie_raw = " | ".join(valid_uzas) if valid_uzas else doc_params['opis']
     else:
         uzasadnienie_raw = doc_params['opis']
