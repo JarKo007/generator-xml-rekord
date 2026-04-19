@@ -91,11 +91,13 @@ def normalize_filename(name):
     return f"BRAK_NAZWY_{hash_val}"
 
 def load_mapping_dict(uploaded_file):
+    uploaded_file.seek(0) # Zabezpieczenie strumienia danych przed błędem odczytu
     try:
         df_dict = pd.read_excel(uploaded_file, sheet_name='Słowniki')
         df_dict.columns = df_dict.columns.str.strip()
         if 'Nazwa_Excel' in df_dict.columns and 'Nazwa_Systemowa' in df_dict.columns:
-            keys = df_dict['Nazwa_Excel'].astype(str).str.strip()
+            # KLUCZOWA ZMIANA: Zamieniamy klucze ze słownika na małe litery, żeby mapowanie było "kuloodporne"
+            keys = df_dict['Nazwa_Excel'].astype(str).str.strip().str.lower()
             vals = df_dict['Nazwa_Systemowa'].astype(str).str.strip()
             return {k: v for k, v in dict(zip(keys, vals)).items() if k != 'nan'}
     except ValueError: pass 
@@ -121,10 +123,10 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
         uzasadnienie_raw = doc_params['uzasadnienie']
 
     finalne_uzasadnienie = sanitize_xml(uzasadnienie_raw, f"Uzasadnienie ({unit_name})", stats)[:MAX_OPIS_LEN]
-    
     finalny_opis = sanitize_xml(doc_params['opis'], "Opis dokumentu", stats)[:MAX_OPIS_LEN]
 
-    dysponent_sys = mapping_dict.get(unit_name, unit_name)
+    # Mapowanie jednostki również ignoruje wielkość liter
+    dysponent_sys = mapping_dict.get(unit_name.strip().lower(), unit_name)
     bezpieczny_dysponent = sanitize_xml(dysponent_sys, f"Dysponent jednostki", stats)
 
     dok_node = ET.SubElement(typ_xml_node, "Dokument", 
@@ -148,12 +150,33 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         df_sorted['Sposob_finansowania'] = 'WG'
     
+    # --- NOWA LOGIKA ZADAŃ (Ścisłe poleganie na słowniku) ---
     if 'Zadanie' in df_sorted.columns:
-        df_sorted['Zad_Sys'] = df_sorted['Zadanie'].fillna('').astype(str).str.strip()
-        df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: str(mapping_dict.get(x, x)))
-        df_sorted.loc[df_sorted['Zad_Sys'].isin(['nan', '', 'None']), 'Zad_Sys'] = ""
+        def apply_zadanie_mapping(val):
+            v_str = str(val).strip()
+            v_low = v_str.lower()
+            
+            # Jeśli wpisano pustą komórkę, zwracamy pustą wartość
+            if v_low in ['nan', 'none', '']: 
+                return ""
+                
+            # Jeśli tekst JEST w Słowniku, pobieramy przypisany mu kod (np. Zad_01)
+            if v_low in mapping_dict:
+                return mapping_dict[v_low]
+                
+            # Jeśli wpisano z palca krótki kod bez spacji, który wygląda na systemowy (np. Zad_01)
+            # pozwalamy mu przejść bez mapowania.
+            if " " not in v_str and len(v_str) <= 15:
+                return v_str
+                
+            # Jeśli to był tekst opisowy (np. "Wymiana okien") i NIE BYŁO go w Słowniku:
+            # NIE kopiujemy go do XML, tylko zostawiamy pustą wartość, chroniąc plik przed błędem.
+            return ""
+
+        df_sorted['Zad_Sys'] = df_sorted['Zadanie'].apply(apply_zadanie_mapping)
     else:
         df_sorted['Zad_Sys'] = ""
+    # --------------------------------------------------------
         
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
     
@@ -231,7 +254,6 @@ st.sidebar.header("📝 Dane Dokumentu")
 d_date = st.sidebar.date_input("Data dokumentu", datetime.today())
 d_nr = st.sidebar.text_input("Numer", "ZMIANA/2026/01")
 
-# Zaktualizowane domyślne teksty dla Opisu i Uzasadnienia
 d_opis = st.sidebar.text_input("Opis dokumentu", "Zmiana planu finansowego", help="Ogólny opis dokumentu (tag OPIS).")
 d_uzas = st.sidebar.text_area("Uzasadnienie (domyślne)", "Wprowadzenie zmian w planie finansowym", help="Szczegółowe uzasadnienie (tag UZASADNIENIE). Zostanie użyte dla jednostek, które nie mają wypełnionej kolumny Uzasadnienie w Excelu.")
 
@@ -266,6 +288,7 @@ if f:
     if mapping: st.sidebar.success(f"Wczytano słownik: {len(mapping)} mapowań.")
     
     try:
+        f.seek(0) # PONOWNE ZABEZPIECZENIE: Cofamy "kursor" pliku na początek, aby pandas przeczytał go w całości
         df = pd.read_excel(f, sheet_name='Zmiany')
         df.columns = df.columns.str.strip()
         
