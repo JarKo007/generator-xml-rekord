@@ -37,12 +37,10 @@ def clean_id(value, length=None, strict_mode=True):
     """Czyszczenie identyfikatorów - wyciąga tylko cyfry z komórki."""
     if pd.isna(value): return None
     
-    # Konwersja do tekstu i bezpieczne usunięcie ".0" po ułamkach Pandasa
     val_str = str(value).strip()
     if val_str.endswith('.0'):
         val_str = val_str[:-2]
         
-    # Usuwamy wszystko, co nie jest cyfrą
     val_str = re.sub(r'[^\d]', '', val_str)
     
     try:
@@ -114,14 +112,18 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     typ_xml_node = ET.SubElement(root, typ_str)
     
     if 'Uzasadnienie' in data_frame.columns:
-        # Dodajemy fillna('') i wymuszamy str() na każdym elemencie, żeby zabić "floata"
         uzas_list = data_frame['Uzasadnienie'].fillna('').astype(str).str.strip()
         valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
-        uzasadnienie_raw = " | ".join(valid_uzas) if valid_uzas else doc_params['opis']
+        uzasadnienie_raw = " | ".join(valid_uzas)
+        if not uzasadnienie_raw.strip():
+            uzasadnienie_raw = doc_params['uzasadnienie']
     else:
-        uzasadnienie_raw = doc_params['opis']
+        uzasadnienie_raw = doc_params['uzasadnienie']
 
-    finalny_opis = sanitize_xml(uzasadnienie_raw, f"Uzasadnienie ({unit_name})", stats)[:MAX_OPIS_LEN]
+    finalne_uzasadnienie = sanitize_xml(uzasadnienie_raw, f"Uzasadnienie ({unit_name})", stats)[:MAX_OPIS_LEN]
+    
+    finalny_opis = sanitize_xml(doc_params['opis'], "Opis dokumentu", stats)[:MAX_OPIS_LEN]
+
     dysponent_sys = mapping_dict.get(unit_name, unit_name)
     bezpieczny_dysponent = sanitize_xml(dysponent_sys, f"Dysponent jednostki", stats)
 
@@ -131,7 +133,9 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
                              DATA_DOK=doc_params['data_dok'], 
                              ROK=doc_params['rok'], MC=doc_params['mc'], 
                              ROK_BUD=doc_params['rok'], ROK_KSIEGOWY=doc_params['rok'], 
-                             MC_KSIEG=doc_params['mc'], OPIS=finalny_opis, 
+                             MC_KSIEG=doc_params['mc'], 
+                             OPIS=finalny_opis,                   
+                             UZASADNIENIE=finalne_uzasadnienie,   
                              P_PIERWOTNY="N", P_WNW="N", TYP_ZMIANY=typ_zmiany_val)
     
     df_sorted = data_frame.copy()
@@ -144,13 +148,12 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         df_sorted['Sposob_finansowania'] = 'WG'
     
-    # Bezpieczne parsowanie kolumny Zadanie
     if 'Zadanie' in df_sorted.columns:
         df_sorted['Zad_Sys'] = df_sorted['Zadanie'].fillna('').astype(str).str.strip()
         df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: str(mapping_dict.get(x, x)))
-        df_sorted.loc[df_sorted['Zad_Sys'].isin(['nan', '', 'None']), 'Zad_Sys'] = "000000000"
+        df_sorted.loc[df_sorted['Zad_Sys'].isin(['nan', '', 'None']), 'Zad_Sys'] = ""
     else:
-        df_sorted['Zad_Sys'] = "000000000"
+        df_sorted['Zad_Sys'] = ""
         
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
     
@@ -227,7 +230,10 @@ st.set_page_config(page_title="Konwerter Budżetowy Rekord", layout="wide")
 st.sidebar.header("📝 Dane Dokumentu")
 d_date = st.sidebar.date_input("Data dokumentu", datetime.today())
 d_nr = st.sidebar.text_input("Numer", "ZMIANA/2026/01")
-d_opis = st.sidebar.text_input("Uzasadnienie (fallback)", "Zmiana planu")
+
+# Zaktualizowane domyślne teksty dla Opisu i Uzasadnienia
+d_opis = st.sidebar.text_input("Opis dokumentu", "Zmiana planu finansowego", help="Ogólny opis dokumentu (tag OPIS).")
+d_uzas = st.sidebar.text_area("Uzasadnienie (domyślne)", "Wprowadzenie zmian w planie finansowym", help="Szczegółowe uzasadnienie (tag UZASADNIENIE). Zostanie użyte dla jednostek, które nie mają wypełnionej kolumny Uzasadnienie w Excelu.")
 
 st.sidebar.header("⚙️ Ustawienia Księgowe")
 
@@ -244,10 +250,11 @@ wybrana_etykieta_zmiany = st.sidebar.selectbox(
 typ_zmiany_opcja = opcje_typu_zmiany[wybrana_etykieta_zmiany]
 
 strict_mode = st.sidebar.checkbox("Restrykcyjna walidacja danych", value=True, help="Zaznaczone: Odrzuca dziwne ułamki i nadmiarowe przecinki. Odznaczone: Próbuje zgadywać i naprawiać.")
-audit_mode = st.sidebar.checkbox("Tryb Audytu (Analiza Danych)", value=False, help="Wyświetla szczegółowe informacje m.in. o zsumowanych wierszach na identycznej klasyfikacji.")
+audit_mode = st.sidebar.checkbox("Tryb Audytu (Analiza Danych)", value=True, help="Wyświetla szczegółowe informacje m.in. o zsumowanych wierszach na identycznej klasyfikacji.")
 
 d_params = {'nr_dok': d_nr, 'data_dok': d_date.strftime("%Y-%m-%d"), 
-            'rok': str(d_date.year), 'mc': str(d_date.month), 'opis': d_opis}
+            'rok': str(d_date.year), 'mc': str(d_date.month), 
+            'opis': d_opis, 'uzasadnienie': d_uzas}
 
 st.title("🚀 Generator XML dla Rekord SI")
 
@@ -278,6 +285,12 @@ if f:
         df['Zmiana_num'] = df['Zmiana'].apply(lambda x: parse_kwota(x, strict_mode)).astype(pd.Int64Dtype())
         df['Jednostka_clean'] = df['Jednostka'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True)
         
+        cols_zadan = [c for c in df.columns if 'zadan' in c.lower()]
+        if cols_zadan:
+            df['Zadanie'] = df[cols_zadan[0]]
+        else:
+            df['Zadanie'] = ""
+            
         errors = []
         df_valid = df[df['Jednostka_clean'].notna() & (df['Jednostka_clean'] != '') & (df['Jednostka_clean'] != 'nan')].copy()
         
