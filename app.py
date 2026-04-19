@@ -33,6 +33,14 @@ def sanitize_xml(text, context=None, stats=None):
         if context: stats['sanitized_details'].add(context)
     return cleaned_text
 
+def normalize_text(s):
+    """Normalizuje tekst, usuwając dziwne cudzysłowy i podwójne spacje (np. po wklejeniu z Worda)."""
+    if pd.isna(s): return ""
+    s = str(s).strip().lower()
+    s = s.replace('„', '"').replace('”', '"').replace("’", "'").replace("‘", "'")
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
 def clean_id(value, length=None, strict_mode=True):
     """Czyszczenie identyfikatorów - wyciąga tylko cyfry z komórki."""
     if pd.isna(value): return None
@@ -41,7 +49,13 @@ def clean_id(value, length=None, strict_mode=True):
     if val_str.endswith('.0'):
         val_str = val_str[:-2]
         
-    val_str = re.sub(r'[^\d]', '', val_str)
+    if strict_mode:
+        # W trybie restrykcyjnym odrzucamy komórki z literami wewnątrz kodu (np. '80A10')
+        if not re.fullmatch(r'\d+', val_str):
+            return None
+    else:
+        # W trybie luźnym po prostu wyciągamy cyfry
+        val_str = re.sub(r'[^\d]', '', val_str)
     
     try:
         if length and len(val_str) > length:
@@ -91,21 +105,40 @@ def normalize_filename(name):
     return f"BRAK_NAZWY_{hash_val}"
 
 def load_mapping_dict(uploaded_file):
-    uploaded_file.seek(0) # Zabezpieczenie strumienia danych przed błędem odczytu
+    """Wczytuje Słowniki, automatycznie rozdzielając je na Dysponentów i Zadania jeśli istnieje kolumna Typ_słownika."""
+    uploaded_file.seek(0)
     try:
         df_dict = pd.read_excel(uploaded_file, sheet_name='Słowniki')
         df_dict.columns = df_dict.columns.str.strip()
+        
+        has_type = 'Typ_słownika' in df_dict.columns
+        dysponent_map = {}
+        zadanie_map = {}
+        
         if 'Nazwa_Excel' in df_dict.columns and 'Nazwa_Systemowa' in df_dict.columns:
-            # KLUCZOWA ZMIANA: Zamieniamy klucze ze słownika na małe litery, żeby mapowanie było "kuloodporne"
-            keys = df_dict['Nazwa_Excel'].astype(str).str.strip().str.lower()
-            vals = df_dict['Nazwa_Systemowa'].astype(str).str.strip()
-            return {k: v for k, v in dict(zip(keys, vals)).items() if k != 'nan'}
+            for _, row in df_dict.iterrows():
+                k = normalize_text(row['Nazwa_Excel'])
+                v = str(row['Nazwa_Systemowa']).strip()
+                if pd.isna(k) or not k or k == 'nan': continue
+                
+                t = str(row.get('Typ_słownika', '')).strip().lower() if has_type else ''
+                
+                if t == 'zadanie':
+                    zadanie_map[k] = v
+                elif t == 'dysponent':
+                    dysponent_map[k] = v
+                else:
+                    # Fallback jeśli nie ma typu (działa starym sposobem dla obu)
+                    zadanie_map[k] = v
+                    dysponent_map[k] = v
+                    
+        return {"dysponent": dysponent_map, "zadanie": zadanie_map}
     except ValueError: pass 
     except Exception as e: st.warning(f"⚠️ Ostrzeżenie ze Słownika: ({e})")
-    return {}
+    return {"dysponent": {}, "zadanie": {}}
 
 def format_pln(amount):
-    return f"{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+    return f"{float(amount):,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
 
 def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, typ_zmiany_val):
     if data_frame.empty: return ""
@@ -125,8 +158,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     finalne_uzasadnienie = sanitize_xml(uzasadnienie_raw, f"Uzasadnienie ({unit_name})", stats)[:MAX_OPIS_LEN]
     finalny_opis = sanitize_xml(doc_params['opis'], "Opis dokumentu", stats)[:MAX_OPIS_LEN]
 
-    # Mapowanie jednostki również ignoruje wielkość liter
-    dysponent_sys = mapping_dict.get(unit_name.strip().lower(), unit_name)
+    dysponent_sys = mapping_dict["dysponent"].get(normalize_text(unit_name), unit_name)
     bezpieczny_dysponent = sanitize_xml(dysponent_sys, f"Dysponent jednostki", stats)
 
     dok_node = ET.SubElement(typ_xml_node, "Dokument", 
@@ -150,33 +182,26 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         df_sorted['Sposob_finansowania'] = 'WG'
     
-    # --- NOWA LOGIKA ZADAŃ (Ścisłe poleganie na słowniku) ---
     if 'Zadanie' in df_sorted.columns:
         def apply_zadanie_mapping(val):
             v_str = str(val).strip()
-            v_low = v_str.lower()
+            v_low = normalize_text(val)
             
-            # Jeśli wpisano pustą komórkę, zwracamy pustą wartość
-            if v_low in ['nan', 'none', '']: 
-                return ""
+            if v_low in ['nan', 'none', '']: return ""
                 
-            # Jeśli tekst JEST w Słowniku, pobieramy przypisany mu kod (np. Zad_01)
-            if v_low in mapping_dict:
-                return mapping_dict[v_low]
+            if v_low in mapping_dict["zadanie"]:
+                return mapping_dict["zadanie"][v_low]
                 
-            # Jeśli wpisano z palca krótki kod bez spacji, który wygląda na systemowy (np. Zad_01)
-            # pozwalamy mu przejść bez mapowania.
-            if " " not in v_str and len(v_str) <= 15:
+            if re.fullmatch(r'[A-Za-z0-9_]{1,15}', v_str):
                 return v_str
                 
-            # Jeśli to był tekst opisowy (np. "Wymiana okien") i NIE BYŁO go w Słowniku:
-            # NIE kopiujemy go do XML, tylko zostawiamy pustą wartość, chroniąc plik przed błędem.
+            # UX FIX: Zapisujemy nierozpoznane zadania opisowe, żeby wyświetlić alert użytkownikowi
+            stats['unknown_tasks'].add(v_str)
             return ""
 
         df_sorted['Zad_Sys'] = df_sorted['Zadanie'].apply(apply_zadanie_mapping)
     else:
         df_sorted['Zad_Sys'] = ""
-    # --------------------------------------------------------
         
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
     
@@ -190,8 +215,9 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     group_sizes = df_sorted.groupby(group_cols).size()
     merged_groups = group_sizes[group_sizes > 1]
     for name, count in merged_groups.items():
-        dz, ro, pa, sf, zs = name
-        stats['merged_details'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa} -> skompresowano {count} wiersze do salda.")
+        if len(stats['merged_details']) < 500: # Zabezpieczenie przed zapchaniem pamięci
+            dz, ro, pa, sf, zs = name
+            stats['merged_details'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa} -> skompresowano {count} wiersze do salda.")
 
     df_grouped = df_sorted.groupby(group_cols, as_index=False)['Zmiana_num'].sum()
     stats['audit_after'] += len(df_grouped)
@@ -285,10 +311,11 @@ f = st.file_uploader("Wgraj Excel (arkusze: Zmiany, Słowniki)", type="xlsx")
 if f:
     start_time = time.time()
     mapping = load_mapping_dict(f)
-    if mapping: st.sidebar.success(f"Wczytano słownik: {len(mapping)} mapowań.")
+    if mapping.get("dysponent"):
+        st.sidebar.success(f"Wczytano słownik: {len(mapping['dysponent'])} jednostek, {len(mapping['zadanie'])} zadań.")
     
     try:
-        f.seek(0) # PONOWNE ZABEZPIECZENIE: Cofamy "kursor" pliku na początek, aby pandas przeczytał go w całości
+        f.seek(0)
         df = pd.read_excel(f, sheet_name='Zmiany')
         df.columns = df.columns.str.strip()
         
@@ -302,6 +329,7 @@ if f:
         df['Rozdzial_clean'] = df['Rozdział'].apply(lambda x: clean_id(x, 5, strict_mode))
         
         dzial_z_kolumny = df['Dział'].apply(lambda x: clean_id(x, 3, strict_mode))
+        # FALLBACK DZIAŁU JEST POPRAWNY (3 pierwsze cyfry Rozdziału to zawsze Dział)
         df['Dzial_clean'] = dzial_z_kolumny.fillna(df['Rozdzial_clean'].str[:3])
         
         df['Paragraf_clean'] = df['§'].apply(lambda x: clean_id(x, 4, strict_mode))
@@ -359,7 +387,7 @@ if f:
             'skipped_zeros': 0, 'runtime_errors_count': 0, 'runtime_errors_list': [], 
             'audit_before': 0, 'audit_after': 0, 'sanitized_chars': 0,
             'sanitized_details': set(), 'suspicious_amounts': 0, 'suspicious_list': [],
-            'dropped_na': 0, 'merged_details': []
+            'dropped_na': 0, 'merged_details': [], 'unknown_tasks': set()
         }
         preview = ""
 
@@ -387,6 +415,15 @@ if f:
 
         st.success(f"Sukces! Wygenerowano {len(used_names)} dokumentów XML dla {len(units)} jednostek. ✅")
         
+        # --- ALERT O ZAGUBIONYCH ZADANIACH ---
+        if stats['unknown_tasks']:
+            st.warning(f"⚠️ UWAGA: Znaleziono {len(stats['unknown_tasks'])} opisów zadań z Excela, których nie ma w Słowniku. W pliku XML ich kody będą puste.")
+            with st.expander("Kliknij, aby zobaczyć niezidentyfikowane opisy zadań"):
+                for t_name in sorted(list(stats['unknown_tasks']))[:20]:
+                    st.write(f"- {t_name}")
+                if len(stats['unknown_tasks']) > 20: st.write("...i więcej.")
+        # -------------------------------------
+
         if bilans_grosze == 0:
             st.info("⚖️ Bilans zmian (globalny) wynosi **0,00 zł** (Idealnie zbilansowane przesunięcie budżetowe).")
         else:
