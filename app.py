@@ -34,15 +34,15 @@ def sanitize_xml(text, context=None, stats=None):
     return cleaned_text
 
 def normalize_text(s):
-    """Normalizuje tekst, usuwając dziwne cudzysłowy i podwójne spacje (np. po wklejeniu z Worda)."""
+    """Normalizuje tekst (Unicode NFKC) oraz usuwa dziwne cudzysłowy i podwójne spacje."""
     if pd.isna(s): return ""
-    s = str(s).strip().lower()
+    s = unicodedata.normalize('NFKC', str(s)) # POPRAWKA: Twarda normalizacja Unicode
+    s = s.strip().lower()
     s = s.replace('„', '"').replace('”', '"').replace("’", "'").replace("‘", "'")
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
 def clean_id(value, length=None, strict_mode=True):
-    """Czyszczenie identyfikatorów - wyciąga tylko cyfry z komórki."""
     if pd.isna(value): return None
     
     val_str = str(value).strip()
@@ -50,11 +50,9 @@ def clean_id(value, length=None, strict_mode=True):
         val_str = val_str[:-2]
         
     if strict_mode:
-        # W trybie restrykcyjnym odrzucamy komórki z literami wewnątrz kodu (np. '80A10')
         if not re.fullmatch(r'\d+', val_str):
             return None
     else:
-        # W trybie luźnym po prostu wyciągamy cyfry
         val_str = re.sub(r'[^\d]', '', val_str)
     
     try:
@@ -72,7 +70,8 @@ def parse_kwota(val, strict_mode=True):
     def to_grosze(numeric_val):
         try:
             dec = Decimal(str(numeric_val))
-            return int(dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) * 100)
+            # POPRAWKA: Bezpieczniejsze przeliczanie na grosze
+            return int((dec * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         except InvalidOperation: return None
 
     if isinstance(val, (int, float)): return to_grosze(val)
@@ -105,7 +104,6 @@ def normalize_filename(name):
     return f"BRAK_NAZWY_{hash_val}"
 
 def load_mapping_dict(uploaded_file):
-    """Wczytuje Słowniki, automatycznie rozdzielając je na Dysponentów i Zadania jeśli istnieje kolumna Typ_słownika."""
     uploaded_file.seek(0)
     try:
         df_dict = pd.read_excel(uploaded_file, sheet_name='Słowniki')
@@ -114,6 +112,7 @@ def load_mapping_dict(uploaded_file):
         has_type = 'Typ_słownika' in df_dict.columns
         dysponent_map = {}
         zadanie_map = {}
+        duplicates = set() # Śledzenie duplikatów
         
         if 'Nazwa_Excel' in df_dict.columns and 'Nazwa_Systemowa' in df_dict.columns:
             for _, row in df_dict.iterrows():
@@ -124,17 +123,23 @@ def load_mapping_dict(uploaded_file):
                 t = str(row.get('Typ_słownika', '')).strip().lower() if has_type else ''
                 
                 if t == 'zadanie':
+                    if k in zadanie_map and zadanie_map[k] != v: duplicates.add(f"Zadanie: '{k}'")
                     zadanie_map[k] = v
                 elif t == 'dysponent':
+                    if k in dysponent_map and dysponent_map[k] != v: duplicates.add(f"Dysponent: '{k}'")
                     dysponent_map[k] = v
                 else:
-                    # Fallback jeśli nie ma typu (działa starym sposobem dla obu)
                     zadanie_map[k] = v
                     dysponent_map[k] = v
                     
+        # POPRAWKA: Informowanie o konfliktach w słowniku
+        if duplicates:
+            st.warning("⚠️ Ostrzeżenie: Wykryto powielone nazwy w słowniku. Ostatnia wartość na liście nadpisała poprzednie:")
+            for d in list(duplicates)[:5]: st.write(f"- {d}")
+                    
         return {"dysponent": dysponent_map, "zadanie": zadanie_map}
     except ValueError: pass 
-    except Exception as e: st.warning(f"⚠️ Ostrzeżenie ze Słownika: ({e})")
+    except Exception as e: st.warning(f"⚠️ Ostrzeżenie przy ładowaniu słownika: ({e})")
     return {"dysponent": {}, "zadanie": {}}
 
 def format_pln(amount):
@@ -195,8 +200,9 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
             if re.fullmatch(r'[A-Za-z0-9_]{1,15}', v_str):
                 return v_str
                 
-            # UX FIX: Zapisujemy nierozpoznane zadania opisowe, żeby wyświetlić alert użytkownikowi
-            stats['unknown_tasks'].add(v_str)
+            # Zapisujemy max 1000 błędów, aby zapobiec przeciążeniu RAM (jak sugerował audyt)
+            if len(stats['unknown_tasks']) < 1000:
+                stats['unknown_tasks'].add(v_str)
             return ""
 
         df_sorted['Zad_Sys'] = df_sorted['Zadanie'].apply(apply_zadanie_mapping)
@@ -215,7 +221,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     group_sizes = df_sorted.groupby(group_cols).size()
     merged_groups = group_sizes[group_sizes > 1]
     for name, count in merged_groups.items():
-        if len(stats['merged_details']) < 500: # Zabezpieczenie przed zapchaniem pamięci
+        if len(stats['merged_details']) < 500: 
             dz, ro, pa, sf, zs = name
             stats['merged_details'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa} -> skompresowano {count} wiersze do salda.")
 
@@ -319,6 +325,14 @@ if f:
         df = pd.read_excel(f, sheet_name='Zmiany')
         df.columns = df.columns.str.strip()
         
+        # POPRAWKA: Walidacja kluczowych kolumn, by zapobiec cichej "awarii" programu
+        required_cols = ['Typ D/W', 'Rozdział', '§', 'Jednostka', 'Zmiana']
+        missing_cols = [c for c in required_cols if c not in df.columns]
+        if missing_cols:
+            st.error(f"🛑 BŁĄD: W arkuszu 'Zmiany' brakuje wymaganych kolumn: {', '.join(missing_cols)}")
+            st.info("Upewnij się, że nagłówki w Excelu są poprawne i nie zawierają literówek.")
+            st.stop()
+        
         type_map = {
             'dochody': 'Dochody', 'dochód': 'Dochody', 'doch': 'Dochody', 'd': 'Dochody', 'dw': 'Dochody',
             'wydatki': 'Wydatki', 'wydatek': 'Wydatki', 'wyd': 'Wydatki', 'w': 'Wydatki', 'wd': 'Wydatki'
@@ -328,9 +342,12 @@ if f:
         
         df['Rozdzial_clean'] = df['Rozdział'].apply(lambda x: clean_id(x, 5, strict_mode))
         
-        dzial_z_kolumny = df['Dział'].apply(lambda x: clean_id(x, 3, strict_mode))
-        # FALLBACK DZIAŁU JEST POPRAWNY (3 pierwsze cyfry Rozdziału to zawsze Dział)
-        df['Dzial_clean'] = dzial_z_kolumny.fillna(df['Rozdzial_clean'].str[:3])
+        # Obsługa Działu (dopuszczamy sytuację, gdy kolumny 'Dział' nie ma)
+        if 'Dział' in df.columns:
+            dzial_z_kolumny = df['Dział'].apply(lambda x: clean_id(x, 3, strict_mode))
+            df['Dzial_clean'] = dzial_z_kolumny.fillna(df['Rozdzial_clean'].str[:3])
+        else:
+            df['Dzial_clean'] = df['Rozdzial_clean'].str[:3]
         
         df['Paragraf_clean'] = df['§'].apply(lambda x: clean_id(x, 4, strict_mode))
         df['Zmiana_num'] = df['Zmiana'].apply(lambda x: parse_kwota(x, strict_mode)).astype(pd.Int64Dtype())
@@ -415,14 +432,12 @@ if f:
 
         st.success(f"Sukces! Wygenerowano {len(used_names)} dokumentów XML dla {len(units)} jednostek. ✅")
         
-        # --- ALERT O ZAGUBIONYCH ZADANIACH ---
         if stats['unknown_tasks']:
             st.warning(f"⚠️ UWAGA: Znaleziono {len(stats['unknown_tasks'])} opisów zadań z Excela, których nie ma w Słowniku. W pliku XML ich kody będą puste.")
             with st.expander("Kliknij, aby zobaczyć niezidentyfikowane opisy zadań"):
                 for t_name in sorted(list(stats['unknown_tasks']))[:20]:
                     st.write(f"- {t_name}")
                 if len(stats['unknown_tasks']) > 20: st.write("...i więcej.")
-        # -------------------------------------
 
         if bilans_grosze == 0:
             st.info("⚖️ Bilans zmian (globalny) wynosi **0,00 zł** (Idealnie zbilansowane przesunięcie budżetowe).")
