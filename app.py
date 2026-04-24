@@ -142,7 +142,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     root = ET.Element("Plan", wersja="1.0")
     typ_xml_node = ET.SubElement(root, typ_str)
     
-    # 1. Przygotowanie OPISU głównego (<200 znaków) złączonego z Uzasadnieniem
+    # Przygotowanie OPISU głównego (<200 znaków) złączonego z Uzasadnieniem
     if 'Uzasadnienie' in data_frame.columns:
         uzas_list = data_frame['Uzasadnienie'].fillna('').astype(str).str.strip()
         valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
@@ -163,7 +163,6 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     dysponent_sys = mapping_dict["dysponent"].get(normalize_text(unit_name), unit_name)
     bezpieczny_dysponent = sanitize_xml(dysponent_sys, f"Dysponent jednostki", stats)
 
-    # 2. Tworzenie nagłówka Dokumentu (BEZ atrybutu UZASADNIENIE)
     dok_node = ET.SubElement(typ_xml_node, "Dokument", 
                              PodstawaPrawna=podstawa_opcja, 
                              TYP="2" if typ_str == "Wydatki" else "1", 
@@ -185,29 +184,21 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         df_sorted['Sposob_finansowania'] = 'WG'
     
-    # 3. Logika Zadań (Fallback na "000000000")
     if 'Zadanie' in df_sorted.columns:
         def apply_zadanie_mapping(val):
             v_str = str(val).strip()
             v_low = normalize_text(val)
-            
             if v_low in ['nan', 'none', '']: return "000000000"
-                
             if v_low in mapping_dict["zadanie"]: return mapping_dict["zadanie"][v_low]
-                
             if re.fullmatch(r'[A-Za-z0-9_]{1,15}', v_str): return v_str
-                
-            if len(stats['unknown_tasks']) < 1000:
-                stats['unknown_tasks'].add(v_str)
+            if len(stats['unknown_tasks']) < 1000: stats['unknown_tasks'].add(v_str)
             return "000000000"
-
         df_sorted['Zad_Sys'] = df_sorted['Zadanie'].apply(apply_zadanie_mapping)
     else:
         df_sorted['Zad_Sys'] = "000000000"
         
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
     
-    # 4. Grupowanie 
     group_cols = ['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean', 'Sposob_finansowania', 'Zad_Sys']
     
     before_drop = len(df_sorted)
@@ -257,7 +248,6 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
             stats['suspicious_amounts'] += 1
             stats['suspicious_list'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa} -> **{format_pln(kwota_zl)} zł**")
 
-        # 5. Czysta, zgodna z XSD struktura Pozycji (BEZ Opisu i Uzasadnienia)
         ET.SubElement(dok_node, "Pozycja", 
                       Dysponent=bezpieczny_dysponent, SposobFinansowania=sanitize_xml(sposob_fin, "Sposób finansowania", stats), 
                       Dzial=dz, Rozdzial=ro, Paragraf=pa, 
@@ -286,11 +276,10 @@ d_date = st.sidebar.date_input("Data dokumentu", datetime.today())
 d_nr = st.sidebar.text_input("Numer", "ZMIANA/2026/01")
 
 d_opis = st.sidebar.text_input("Opis dokumentu", "Zmiana planu finansowego", help="Ogólny opis dokumentu.")
-d_uzas = st.sidebar.text_area("Uzasadnienie (domyślne)", "Wprowadzenie zmian w planie finansowym", help="Zostanie doklejone do opisu głównego i bezpiecznie skrócone (limit systemu to 200 znaków łącznie).")
+d_uzas = st.sidebar.text_area("Uzasadnienie (domyślne)", "Wprowadzenie zmian w planie finansowym", help="Zostanie wygenerowane w osobnym pliku TXT dla księgowości oraz doklejone do opisu głównego w XML.")
 
 st.sidebar.header("⚙️ Ustawienia Księgowe")
 
-# Wybór podstawy prawnej (Prezydent vs Rada)
 opcje_podstawy = {
     "DP - Kompetencja Prezydenta (WDP / WWP)": "DP",
     "UR - Kompetencja Rady Miasta (WDR / WWR)": "UR"
@@ -303,7 +292,6 @@ wybrana_podstawa_etykieta = st.sidebar.selectbox(
 )
 podstawa_opcja = opcje_podstawy[wybrana_podstawa_etykieta]
 
-# Typ zmiany dopasowany w 100% do schematu XSD
 opcje_typu_zmiany = {
     "0 - Wniosek o zmianę planu (np. WOR, WWP)": "0",
     "10 - Uchwała/Zarządzenie (Dokument zatwierdzony)": "10"
@@ -418,16 +406,33 @@ if f:
             'dropped_na': 0, 'merged_details': [], 'unknown_tasks': set()
         }
         preview = ""
+        
+        # --- NOWOŚĆ: Lista do zbierania uzasadnień dla pliku TXT ---
+        uzasadnienia_raport = []
 
         with zipfile.ZipFile(z_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for unit in units:
                 u_df = df_valid[df_valid['Jednostka_clean'] == unit]
+                
+                # Zbierz unikalne uzasadnienia z całej jednostki (Dochody + Wydatki)
+                unit_uzas = ""
+                if 'Uzasadnienie' in u_df.columns:
+                    uzas_list = u_df['Uzasadnienie'].fillna('').astype(str).str.strip()
+                    valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
+                    if valid_uzas:
+                        unit_uzas = " | ".join(valid_uzas)
+                
+                # Jeśli w Excelu było puste, użyj domyślnego z lewego panelu
+                if not unit_uzas:
+                    unit_uzas = d_uzas
+                
+                # Format wymagany przez użytkownika
+                uzasadnienia_raport.append(f"[{unit}]:\n{unit_uzas}\n")
+                
+                # Generowanie XML-i Dochody/Wydatki
                 for t in sorted(x for x in u_df['Typ_DW_norm'].unique() if x in ['Dochody', 'Wydatki']):
                     sub = u_df[u_df['Typ_DW_norm'] == t].reset_index(drop=True)
-                    
-                    # Wrzucamy do create_xml nasz typ_zmiany_opcja ORAZ podstawa_opcja
                     xml = create_xml(sub, d_params, unit, mapping, t, stats, typ_zmiany_opcja, podstawa_opcja)
-                    
                     if not xml: continue 
                     if not preview: preview = xml
                     
@@ -438,12 +443,17 @@ if f:
                         c += 1
                     used_names.add(fname)
                     zf.writestr(fname, xml.encode('utf-8'))
+            
+            # --- NOWOŚĆ: Dodajemy wygenerowany raport tekstowy do paczki ZIP ---
+            if uzasadnienia_raport:
+                txt_content = "\n".join(uzasadnienia_raport)
+                zf.writestr("Zbiorcze_Uzasadnienia.txt", txt_content.encode('utf-8'))
 
         if not used_names:
             st.warning("⚠️ Brak danych do wygenerowania. System usunął puste pola i wyzerowane kwoty.")
             st.stop()
 
-        st.success(f"Sukces! Wygenerowano {len(used_names)} dokumentów XML dla {len(units)} jednostek. ✅")
+        st.success(f"Sukces! Wygenerowano {len(used_names)} dokumentów XML oraz 1 plik TXT z uzasadnieniami dla {len(units)} jednostek. ✅")
         
         if stats['unknown_tasks']:
             st.warning(f"⚠️ UWAGA: Znaleziono {len(stats['unknown_tasks'])} opisów zadań z Excela, których nie ma w Słowniku. W pliku XML ich kody przyjmą wartość 000000000.")
