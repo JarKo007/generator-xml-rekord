@@ -13,7 +13,7 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
 # --- KONFIGURACJA BIZNESOWA ---
 MAX_ZAD_LEN = 23
-MAX_OPIS_LEN = 1500
+MAX_OPIS_LEN = 199 # Twardy limit z pliku XSD (<xs:maxLength value="200"/>)
 WARN_AMOUNT_THRESHOLD = 1_000_000_000      # 1 miliard złotych
 ERROR_AMOUNT_THRESHOLD = 100_000_000_000   # 100 miliardów złotych
 
@@ -34,7 +34,6 @@ def sanitize_xml(text, context=None, stats=None):
     return cleaned_text
 
 def normalize_text(s):
-    """Normalizuje tekst (Unicode NFKC) oraz usuwa dziwne cudzysłowy i podwójne spacje."""
     if pd.isna(s): return ""
     s = unicodedata.normalize('NFKC', str(s))
     s = s.strip().lower()
@@ -44,21 +43,17 @@ def normalize_text(s):
 
 def clean_id(value, length=None, strict_mode=True):
     if pd.isna(value): return None
-    
     val_str = str(value).strip()
     if val_str.endswith('.0'):
         val_str = val_str[:-2]
-        
     if strict_mode:
         if not re.fullmatch(r'\d+', val_str):
             return None
     else:
         val_str = re.sub(r'[^\d]', '', val_str)
-    
     try:
         if length and len(val_str) > length:
             val_str = val_str[-length:]
-            
         if val_str.isdigit(): 
             return val_str.zfill(length) if length else val_str
         return None
@@ -109,9 +104,7 @@ def load_mapping_dict(uploaded_file):
         df_dict.columns = df_dict.columns.str.strip()
         
         has_type = 'Typ_słownika' in df_dict.columns
-        dysponent_map = {}
-        zadanie_map = {}
-        duplicates = set() 
+        dysponent_map, zadanie_map, duplicates = {}, {}, set()
         
         if 'Nazwa_Excel' in df_dict.columns and 'Nazwa_Systemowa' in df_dict.columns:
             for _, row in df_dict.iterrows():
@@ -128,8 +121,7 @@ def load_mapping_dict(uploaded_file):
                     if k in dysponent_map and dysponent_map[k] != v: duplicates.add(f"Dysponent: '{k}'")
                     dysponent_map[k] = v
                 else:
-                    zadanie_map[k] = v
-                    dysponent_map[k] = v
+                    zadanie_map[k], dysponent_map[k] = v, v
                     
         if duplicates:
             st.warning("⚠️ Ostrzeżenie: Wykryto powielone nazwy w słowniku. Ostatnia wartość na liście nadpisała poprzednie:")
@@ -143,13 +135,14 @@ def load_mapping_dict(uploaded_file):
 def format_pln(amount):
     return f"{float(amount):,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
 
-def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, typ_zmiany_val):
+# --- GŁÓWNA FUNKCJA GENERUJĄCA XML ---
+def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, typ_zmiany_val, podstawa_opcja):
     if data_frame.empty: return ""
         
     root = ET.Element("Plan", wersja="1.0")
     typ_xml_node = ET.SubElement(root, typ_str)
     
-    # --- NAGŁÓWEK DOKUMENTU ---
+    # 1. Przygotowanie OPISU głównego (<200 znaków) złączonego z Uzasadnieniem
     if 'Uzasadnienie' in data_frame.columns:
         uzas_list = data_frame['Uzasadnienie'].fillna('').astype(str).str.strip()
         valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
@@ -159,21 +152,27 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         uzasadnienie_raw = doc_params['uzasadnienie']
 
-    finalne_uzasadnienie = sanitize_xml(uzasadnienie_raw, f"Uzasadnienie ({unit_name})", stats)[:MAX_OPIS_LEN]
-    finalny_opis = sanitize_xml(doc_params['opis'], "Opis dokumentu", stats)[:MAX_OPIS_LEN]
+    # Łączymy w jeden tekst i ucinamy do MAX_OPIS_LEN (199 znaków, bo XSD pozwala na 200)
+    if uzasadnienie_raw:
+        combined_text = f"{doc_params['opis']} - {uzasadnienie_raw}"
+    else:
+        combined_text = doc_params['opis']
+        
+    finalny_opis = sanitize_xml(combined_text, f"Opis skompresowany ({unit_name})", stats)[:MAX_OPIS_LEN]
 
     dysponent_sys = mapping_dict["dysponent"].get(normalize_text(unit_name), unit_name)
     bezpieczny_dysponent = sanitize_xml(dysponent_sys, f"Dysponent jednostki", stats)
 
+    # 2. Tworzenie nagłówka Dokumentu (BEZ atrybutu UZASADNIENIE)
     dok_node = ET.SubElement(typ_xml_node, "Dokument", 
-                             PodstawaPrawna="DP", TYP="2" if typ_str == "Wydatki" else "1", 
+                             PodstawaPrawna=podstawa_opcja, 
+                             TYP="2" if typ_str == "Wydatki" else "1", 
                              NR_DOK=sanitize_xml(doc_params['nr_dok'], "Nr Dokumentu", stats), 
                              DATA_DOK=doc_params['data_dok'], 
                              ROK=doc_params['rok'], MC=doc_params['mc'], 
                              ROK_BUD=doc_params['rok'], ROK_KSIEGOWY=doc_params['rok'], 
                              MC_KSIEG=doc_params['mc'], 
                              OPIS=finalny_opis,                   
-                             UZASADNIENIE=finalne_uzasadnienie,   
                              P_PIERWOTNY="N", P_WNW="N", TYP_ZMIANY=typ_zmiany_val)
     
     df_sorted = data_frame.copy()
@@ -186,7 +185,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         df_sorted['Sposob_finansowania'] = 'WG'
     
-    # --- ZADANIA (Fallback na 000000000) ---
+    # 3. Logika Zadań (Fallback na "000000000")
     if 'Zadanie' in df_sorted.columns:
         def apply_zadanie_mapping(val):
             v_str = str(val).strip()
@@ -194,11 +193,9 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
             
             if v_low in ['nan', 'none', '']: return "000000000"
                 
-            if v_low in mapping_dict["zadanie"]:
-                return mapping_dict["zadanie"][v_low]
+            if v_low in mapping_dict["zadanie"]: return mapping_dict["zadanie"][v_low]
                 
-            if re.fullmatch(r'[A-Za-z0-9_]{1,15}', v_str):
-                return v_str
+            if re.fullmatch(r'[A-Za-z0-9_]{1,15}', v_str): return v_str
                 
             if len(stats['unknown_tasks']) < 1000:
                 stats['unknown_tasks'].add(v_str)
@@ -210,10 +207,8 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
         
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
     
-    # --- UZASADNIENIE POZYCJI (Bez Opisu) ---
-    df_sorted['Pozycja_Uzasadnienie'] = df_sorted['Uzasadnienie'].fillna('') if 'Uzasadnienie' in df_sorted.columns else ""
-
-    group_cols = ['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean', 'Sposob_finansowania', 'Zad_Sys', 'Pozycja_Uzasadnienie']
+    # 4. Grupowanie 
+    group_cols = ['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean', 'Sposob_finansowania', 'Zad_Sys']
     
     before_drop = len(df_sorted)
     df_sorted = df_sorted.dropna(subset=['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean'])
@@ -224,7 +219,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     merged_groups = group_sizes[group_sizes > 1]
     for name, count in merged_groups.items():
         if len(stats['merged_details']) < 500: 
-            dz, ro, pa, sf, zs, pu = name
+            dz, ro, pa, sf, zs = name
             stats['merged_details'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa} -> skompresowano {count} wiersze do salda.")
 
     df_grouped = df_sorted.groupby(group_cols, as_index=False)['Zmiana_num'].sum()
@@ -254,7 +249,6 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
             continue
             
         kwota_zl = Decimal(int(kwota_grosze)) / 100
-        p_uzas = sanitize_xml(row.Pozycja_Uzasadnienie, "Uzasadnienie pozycji", stats)
             
         if abs(kwota_zl) > ERROR_AMOUNT_THRESHOLD:
             raise ValueError(f"KRYTYCZNY BŁĄD BIZNESOWY: Kwota {format_pln(kwota_zl)} zł (Dz:{dz} R:{ro} P:{pa}) w {unit_name} przekracza absolutny limit bezpieczeństwa.")
@@ -263,21 +257,12 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
             stats['suspicious_amounts'] += 1
             stats['suspicious_list'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa} -> **{format_pln(kwota_zl)} zł**")
 
-        # Tworzymy słownik z podstawowymi atrybutami (zawsze wymaganymi)
-        pozycja_attribs = {
-            "Dysponent": bezpieczny_dysponent,
-            "SposobFinansowania": sanitize_xml(sposob_fin, "Sposób finansowania", stats),
-            "Dzial": dz, "Rozdzial": ro, "Paragraf": pa,
-            "Pozycja": "", "Zadanie": zad_sys,
-            "Data": doc_params['data_dok'], "Lp": str(lp), "Plan": f"{kwota_zl:.2f}"
-        }
-        
-        # Atrybut UZASADNIENIE dodajemy tylko wtedy, gdy w komórce Excela był wpisany jakiś tekst.
-        # Pomaga to uniknąć zapychania XML-a pustymi polami UZASADNIENIE="", co mogło powodować błędy.
-        if p_uzas:
-            pozycja_attribs["UZASADNIENIE"] = p_uzas
-
-        ET.SubElement(dok_node, "Pozycja", **pozycja_attribs)
+        # 5. Czysta, zgodna z XSD struktura Pozycji (BEZ Opisu i Uzasadnienia)
+        ET.SubElement(dok_node, "Pozycja", 
+                      Dysponent=bezpieczny_dysponent, SposobFinansowania=sanitize_xml(sposob_fin, "Sposób finansowania", stats), 
+                      Dzial=dz, Rozdzial=ro, Paragraf=pa, 
+                      Pozycja="", Zadanie=zad_sys, 
+                      Data=doc_params['data_dok'], Lp=str(lp), Plan=f"{kwota_zl:.2f}")
         lp += 1
     
     if len(dok_node) == 0: return ""
@@ -292,6 +277,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
         
     return re.sub(r'<\?xml[^>]+\?>', '<?xml version="1.0" encoding="UTF-8"?>', xml_str)
 
+
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Konwerter Budżetowy Rekord", layout="wide")
 
@@ -299,25 +285,39 @@ st.sidebar.header("📝 Dane Dokumentu")
 d_date = st.sidebar.date_input("Data dokumentu", datetime.today())
 d_nr = st.sidebar.text_input("Numer", "ZMIANA/2026/01")
 
-d_opis = st.sidebar.text_input("Opis dokumentu", "Zmiana planu finansowego", help="Ogólny opis dokumentu (tag OPIS).")
-d_uzas = st.sidebar.text_area("Uzasadnienie (domyślne)", "Wprowadzenie zmian w planie finansowym", help="Szczegółowe uzasadnienie (tag UZASADNIENIE). Zostanie użyte dla jednostek, które nie mają wypełnionej kolumny Uzasadnienie w Excelu.")
+d_opis = st.sidebar.text_input("Opis dokumentu", "Zmiana planu finansowego", help="Ogólny opis dokumentu.")
+d_uzas = st.sidebar.text_area("Uzasadnienie (domyślne)", "Wprowadzenie zmian w planie finansowym", help="Zostanie doklejone do opisu głównego i bezpiecznie skrócone (limit systemu to 200 znaków łącznie).")
 
 st.sidebar.header("⚙️ Ustawienia Księgowe")
 
+# Wybór podstawy prawnej (Prezydent vs Rada)
+opcje_podstawy = {
+    "DP - Kompetencja Prezydenta (WDP / WWP)": "DP",
+    "UR - Kompetencja Rady Miasta (WDR / WWR)": "UR"
+}
+wybrana_podstawa_etykieta = st.sidebar.selectbox(
+    "Kompetencja / Podstawa prawna", 
+    options=list(opcje_podstawy.keys()), 
+    index=0,
+    help="Zmienia atrybut PodstawaPrawna w nagłówku XML."
+)
+podstawa_opcja = opcje_podstawy[wybrana_podstawa_etykieta]
+
+# Typ zmiany dopasowany w 100% do schematu XSD
 opcje_typu_zmiany = {
-    "10 (domyślnie) - uchwała/zarządzenie": "10",
-    "0 - plan początkowy": "0"
+    "0 - Wniosek o zmianę planu (np. WOR, WWP)": "0",
+    "10 - Uchwała/Zarządzenie (Dokument zatwierdzony)": "10"
 }
 wybrana_etykieta_zmiany = st.sidebar.selectbox(
     "Typ Zmiany XML", 
     options=list(opcje_typu_zmiany.keys()), 
     index=0, 
-    help="Zdecyduj o charakterze prawnym importu do systemu Rekord."
+    help="Zgodnie ze schematem XSD Rekord SI: 0 = Wnioski robocze, 10 = Zatwierdzone decyzje/uchwały."
 )
 typ_zmiany_opcja = opcje_typu_zmiany[wybrana_etykieta_zmiany]
 
-strict_mode = st.sidebar.checkbox("Restrykcyjna walidacja danych", value=True, help="Zaznaczone: Odrzuca dziwne ułamki i nadmiarowe przecinki. Odznaczone: Próbuje zgadywać i naprawiać.")
-audit_mode = st.sidebar.checkbox("Tryb Audytu (Analiza Danych)", value=True, help="Wyświetla szczegółowe informacje m.in. o zsumowanych wierszach na identycznej klasyfikacji.")
+strict_mode = st.sidebar.checkbox("Restrykcyjna walidacja danych", value=True, help="Zaznaczone: Odrzuca dziwne ułamki i nadmiarowe przecinki.")
+audit_mode = st.sidebar.checkbox("Tryb Audytu (Analiza Danych)", value=True, help="Wyświetla szczegóły zsumowanych wierszy.")
 
 d_params = {'nr_dok': d_nr, 'data_dok': d_date.strftime("%Y-%m-%d"), 
             'rok': str(d_date.year), 'mc': str(d_date.month), 
@@ -425,7 +425,9 @@ if f:
                 for t in sorted(x for x in u_df['Typ_DW_norm'].unique() if x in ['Dochody', 'Wydatki']):
                     sub = u_df[u_df['Typ_DW_norm'] == t].reset_index(drop=True)
                     
-                    xml = create_xml(sub, d_params, unit, mapping, t, stats, typ_zmiany_opcja)
+                    # Wrzucamy do create_xml nasz typ_zmiany_opcja ORAZ podstawa_opcja
+                    xml = create_xml(sub, d_params, unit, mapping, t, stats, typ_zmiany_opcja, podstawa_opcja)
+                    
                     if not xml: continue 
                     if not preview: preview = xml
                     
@@ -444,7 +446,7 @@ if f:
         st.success(f"Sukces! Wygenerowano {len(used_names)} dokumentów XML dla {len(units)} jednostek. ✅")
         
         if stats['unknown_tasks']:
-            st.warning(f"⚠️ UWAGA: Znaleziono {len(stats['unknown_tasks'])} opisów zadań z Excela, których nie ma w Słowniku. W pliku XML ich kody będą miały wartość 000000000.")
+            st.warning(f"⚠️ UWAGA: Znaleziono {len(stats['unknown_tasks'])} opisów zadań z Excela, których nie ma w Słowniku. W pliku XML ich kody przyjmą wartość 000000000.")
             with st.expander("Kliknij, aby zobaczyć niezidentyfikowane opisy zadań"):
                 for t_name in sorted(list(stats['unknown_tasks']))[:20]:
                     st.write(f"- {t_name}")
