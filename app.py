@@ -36,7 +36,7 @@ def sanitize_xml(text, context=None, stats=None):
 def normalize_text(s):
     """Normalizuje tekst (Unicode NFKC) oraz usuwa dziwne cudzysłowy i podwójne spacje."""
     if pd.isna(s): return ""
-    s = unicodedata.normalize('NFKC', str(s)) # POPRAWKA: Twarda normalizacja Unicode
+    s = unicodedata.normalize('NFKC', str(s))
     s = s.strip().lower()
     s = s.replace('„', '"').replace('”', '"').replace("’", "'").replace("‘", "'")
     s = re.sub(r'\s+', ' ', s).strip()
@@ -70,7 +70,6 @@ def parse_kwota(val, strict_mode=True):
     def to_grosze(numeric_val):
         try:
             dec = Decimal(str(numeric_val))
-            # POPRAWKA: Bezpieczniejsze przeliczanie na grosze
             return int((dec * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         except InvalidOperation: return None
 
@@ -112,7 +111,7 @@ def load_mapping_dict(uploaded_file):
         has_type = 'Typ_słownika' in df_dict.columns
         dysponent_map = {}
         zadanie_map = {}
-        duplicates = set() # Śledzenie duplikatów
+        duplicates = set() 
         
         if 'Nazwa_Excel' in df_dict.columns and 'Nazwa_Systemowa' in df_dict.columns:
             for _, row in df_dict.iterrows():
@@ -132,7 +131,6 @@ def load_mapping_dict(uploaded_file):
                     zadanie_map[k] = v
                     dysponent_map[k] = v
                     
-        # POPRAWKA: Informowanie o konfliktach w słowniku
         if duplicates:
             st.warning("⚠️ Ostrzeżenie: Wykryto powielone nazwy w słowniku. Ostatnia wartość na liście nadpisała poprzednie:")
             for d in list(duplicates)[:5]: st.write(f"- {d}")
@@ -151,6 +149,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     root = ET.Element("Plan", wersja="1.0")
     typ_xml_node = ET.SubElement(root, typ_str)
     
+    # --- NAGŁÓWEK DOKUMENTU ---
     if 'Uzasadnienie' in data_frame.columns:
         uzas_list = data_frame['Uzasadnienie'].fillna('').astype(str).str.strip()
         valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
@@ -187,12 +186,13 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         df_sorted['Sposob_finansowania'] = 'WG'
     
+    # --- ZADANIA (Fallback na 000000000) ---
     if 'Zadanie' in df_sorted.columns:
         def apply_zadanie_mapping(val):
             v_str = str(val).strip()
             v_low = normalize_text(val)
             
-            if v_low in ['nan', 'none', '']: return ""
+            if v_low in ['nan', 'none', '']: return "000000000"
                 
             if v_low in mapping_dict["zadanie"]:
                 return mapping_dict["zadanie"][v_low]
@@ -200,21 +200,23 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
             if re.fullmatch(r'[A-Za-z0-9_]{1,15}', v_str):
                 return v_str
                 
-            # Zapisujemy max 1000 błędów, aby zapobiec przeciążeniu RAM (jak sugerował audyt)
             if len(stats['unknown_tasks']) < 1000:
                 stats['unknown_tasks'].add(v_str)
-            return ""
+            return "000000000"
 
         df_sorted['Zad_Sys'] = df_sorted['Zadanie'].apply(apply_zadanie_mapping)
     else:
-        df_sorted['Zad_Sys'] = ""
+        df_sorted['Zad_Sys'] = "000000000"
         
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
     
-    group_cols = ['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean', 'Sposob_finansowania', 'Zad_Sys']
+    # --- UZASADNIENIE POZYCJI (Bez Opisu) ---
+    df_sorted['Pozycja_Uzasadnienie'] = df_sorted['Uzasadnienie'].fillna('') if 'Uzasadnienie' in df_sorted.columns else ""
+
+    group_cols = ['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean', 'Sposob_finansowania', 'Zad_Sys', 'Pozycja_Uzasadnienie']
     
     before_drop = len(df_sorted)
-    df_sorted = df_sorted.dropna(subset=group_cols)
+    df_sorted = df_sorted.dropna(subset=['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean'])
     dropped_count = before_drop - len(df_sorted)
     if dropped_count > 0: stats['dropped_na'] += dropped_count
     
@@ -222,7 +224,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     merged_groups = group_sizes[group_sizes > 1]
     for name, count in merged_groups.items():
         if len(stats['merged_details']) < 500: 
-            dz, ro, pa, sf, zs = name
+            dz, ro, pa, sf, zs, pu = name
             stats['merged_details'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa} -> skompresowano {count} wiersze do salda.")
 
     df_grouped = df_sorted.groupby(group_cols, as_index=False)['Zmiana_num'].sum()
@@ -252,6 +254,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
             continue
             
         kwota_zl = Decimal(int(kwota_grosze)) / 100
+        p_uzas = sanitize_xml(row.Pozycja_Uzasadnienie, "Uzasadnienie pozycji", stats)
             
         if abs(kwota_zl) > ERROR_AMOUNT_THRESHOLD:
             raise ValueError(f"KRYTYCZNY BŁĄD BIZNESOWY: Kwota {format_pln(kwota_zl)} zł (Dz:{dz} R:{ro} P:{pa}) w {unit_name} przekracza absolutny limit bezpieczeństwa.")
@@ -260,11 +263,21 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
             stats['suspicious_amounts'] += 1
             stats['suspicious_list'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa} -> **{format_pln(kwota_zl)} zł**")
 
-        ET.SubElement(dok_node, "Pozycja", 
-                      Dysponent=bezpieczny_dysponent, SposobFinansowania=sanitize_xml(sposob_fin, "Sposób finansowania", stats), 
-                      Dzial=dz, Rozdzial=ro, Paragraf=pa, 
-                      Pozycja="", Zadanie=zad_sys, 
-                      Data=doc_params['data_dok'], Lp=str(lp), Plan=f"{kwota_zl:.2f}")
+        # Tworzymy słownik z podstawowymi atrybutami (zawsze wymaganymi)
+        pozycja_attribs = {
+            "Dysponent": bezpieczny_dysponent,
+            "SposobFinansowania": sanitize_xml(sposob_fin, "Sposób finansowania", stats),
+            "Dzial": dz, "Rozdzial": ro, "Paragraf": pa,
+            "Pozycja": "", "Zadanie": zad_sys,
+            "Data": doc_params['data_dok'], "Lp": str(lp), "Plan": f"{kwota_zl:.2f}"
+        }
+        
+        # Atrybut UZASADNIENIE dodajemy tylko wtedy, gdy w komórce Excela był wpisany jakiś tekst.
+        # Pomaga to uniknąć zapychania XML-a pustymi polami UZASADNIENIE="", co mogło powodować błędy.
+        if p_uzas:
+            pozycja_attribs["UZASADNIENIE"] = p_uzas
+
+        ET.SubElement(dok_node, "Pozycja", **pozycja_attribs)
         lp += 1
     
     if len(dok_node) == 0: return ""
@@ -325,7 +338,6 @@ if f:
         df = pd.read_excel(f, sheet_name='Zmiany')
         df.columns = df.columns.str.strip()
         
-        # POPRAWKA: Walidacja kluczowych kolumn, by zapobiec cichej "awarii" programu
         required_cols = ['Typ D/W', 'Rozdział', '§', 'Jednostka', 'Zmiana']
         missing_cols = [c for c in required_cols if c not in df.columns]
         if missing_cols:
@@ -342,7 +354,6 @@ if f:
         
         df['Rozdzial_clean'] = df['Rozdział'].apply(lambda x: clean_id(x, 5, strict_mode))
         
-        # Obsługa Działu (dopuszczamy sytuację, gdy kolumny 'Dział' nie ma)
         if 'Dział' in df.columns:
             dzial_z_kolumny = df['Dział'].apply(lambda x: clean_id(x, 3, strict_mode))
             df['Dzial_clean'] = dzial_z_kolumny.fillna(df['Rozdzial_clean'].str[:3])
@@ -433,7 +444,7 @@ if f:
         st.success(f"Sukces! Wygenerowano {len(used_names)} dokumentów XML dla {len(units)} jednostek. ✅")
         
         if stats['unknown_tasks']:
-            st.warning(f"⚠️ UWAGA: Znaleziono {len(stats['unknown_tasks'])} opisów zadań z Excela, których nie ma w Słowniku. W pliku XML ich kody będą puste.")
+            st.warning(f"⚠️ UWAGA: Znaleziono {len(stats['unknown_tasks'])} opisów zadań z Excela, których nie ma w Słowniku. W pliku XML ich kody będą miały wartość 000000000.")
             with st.expander("Kliknij, aby zobaczyć niezidentyfikowane opisy zadań"):
                 for t_name in sorted(list(stats['unknown_tasks']))[:20]:
                     st.write(f"- {t_name}")
