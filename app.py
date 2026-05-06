@@ -191,11 +191,20 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
             if re.fullmatch(r'[A-Za-z0-9_]{1,15}', v_str): return v_str
             if len(stats['unknown_tasks']) < 1000: stats['unknown_tasks'].add(v_str)
             return "000000000"
-        df_sorted['Zad_Sys'] = df_sorted['Zadanie'].apply(apply_zadanie_mapping)
+        df_sorted['Zad_Sys_Raw'] = df_sorted['Zadanie'].apply(apply_zadanie_mapping)
     else:
-        df_sorted['Zad_Sys'] = "000000000"
+        df_sorted['Zad_Sys_Raw'] = "000000000"
         
+    # --- NOWE: Wyciągamy ewentualną pozycję ze Słownika (z Zad_Sys_Raw) ---
+    extracted_poz = df_sorted['Zad_Sys_Raw'].str.extract(r'(?i)_poz(\d{1,6})$', expand=False).fillna("")
+    df_sorted['Zad_Sys'] = df_sorted['Zad_Sys_Raw'].str.replace(r'(?i)_poz\d{1,6}$', '', regex=True).str.strip()
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
+    
+    if 'Pozycja_klas' in df_sorted.columns:
+        # Nadpisujemy pozycję wartością ze Słownika (jeśli tam była)
+        df_sorted['Pozycja_klas'] = extracted_poz.where(extracted_poz != "", df_sorted['Pozycja_klas'])
+    else:
+        df_sorted['Pozycja_klas'] = extracted_poz
     
     group_cols = ['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean', 'Pozycja_klas', 'Sposob_finansowania', 'Zad_Sys']
     
@@ -311,8 +320,7 @@ d_params = {'nr_dok': d_nr, 'data_dok': d_date.strftime("%Y-%m-%d"),
             'rok': str(d_date.year), 'mc': str(d_date.month), 
             'opis': d_opis, 'uzasadnienie': d_uzas}
 
-# Użycie parametru help w st.title stworzy małą ikonę z dymkiem informacyjnym
-st.title("🚀 Generator XML dla Rekord SI", help="Wskazówka dla Pozycji budżetowych:\nJeśli chcesz przypisać Pozycję w Rekordzie (np. przy Budżecie Obywatelskim), po prostu dopisz do nazwy zadania w Excelu końcówkę _Poz i numer. Przykład: wpisanie BO_2026_Poz25 sprawi, że XML otrzyma zadanie BO_2026 oraz pozycję 25.")
+st.title("🚀 Generator XML dla Rekord SI", help="Wskazówka dla Pozycji budżetowych:\nJeśli chcesz przypisać Pozycję w Rekordzie (np. przy Budżecie Obywatelskim), dopisz końcówkę _Poz i numer do nazwy zadania w arkuszu Zmiany LUB w Słowniku (w kolumnie Nazwa_Systemowa). Przykład: wpisanie BO_2026_Poz25 sprawi, że XML otrzyma zadanie BO_2026 oraz pozycję 25.")
 
 f = st.file_uploader("Wgraj Excel (arkusze: Zmiany, Słowniki)", type="xlsx")
 
@@ -354,8 +362,8 @@ if f:
         cols_zadan = [c for c in df.columns if 'zadan' in c.lower()]
         if cols_zadan:
             df['Zadanie_Raw'] = df[cols_zadan[0]].astype(str).str.strip()
-            df['Pozycja_z_Zadania'] = df['Zadanie_Raw'].str.extract(r'_(?i:Poz)(\d{1,6})$', expand=False).fillna("")
-            df['Zadanie'] = df['Zadanie_Raw'].str.replace(r'_(?i:Poz)\d{1,6}$', '', regex=True).str.strip()
+            df['Pozycja_z_Zadania'] = df['Zadanie_Raw'].str.extract(r'(?i)_poz(\d{1,6})$', expand=False).fillna("")
+            df['Zadanie'] = df['Zadanie_Raw'].str.replace(r'(?i)_poz\d{1,6}$', '', regex=True).str.strip()
         else:
             df['Zadanie'] = ""
             df['Pozycja_z_Zadania'] = ""
