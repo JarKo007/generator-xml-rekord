@@ -311,12 +311,8 @@ d_params = {'nr_dok': d_nr, 'data_dok': d_date.strftime("%Y-%m-%d"),
             'rok': str(d_date.year), 'mc': str(d_date.month), 
             'opis': d_opis, 'uzasadnienie': d_uzas}
 
-st.title("🚀 Generator XML dla Rekord SI")
-st.markdown("""
-**💡 Wskazówka dla Pozycji Inwestycyjnych:**
-Jeśli chcesz przypisać **Pozycję** w Rekordzie (np. przy Budżecie Obywatelskim), po prostu dopisz do nazwy zadania w Excelu końcówkę `_Poz` i numer. 
-*Przykład:* wpisanie `BO_2026_Poz25` sprawi, że XML otrzyma zadanie `BO_2026` oraz pozycję `25`.
-""")
+# Użycie parametru help w st.title stworzy małą ikonę z dymkiem informacyjnym
+st.title("🚀 Generator XML dla Rekord SI", help="Wskazówka dla Pozycji budżetowych:\nJeśli chcesz przypisać Pozycję w Rekordzie (np. przy Budżecie Obywatelskim), po prostu dopisz do nazwy zadania w Excelu końcówkę _Poz i numer. Przykład: wpisanie BO_2026_Poz25 sprawi, że XML otrzyma zadanie BO_2026 oraz pozycję 25.")
 
 f = st.file_uploader("Wgraj Excel (arkusze: Zmiany, Słowniki)", type="xlsx")
 
@@ -355,22 +351,17 @@ if f:
         
         df['Paragraf_clean'] = df['§'].apply(lambda x: clean_id(x, 4, strict_mode))
         
-        # --- NOWE: MAGIA EKSTRAKCJI POZYCJI Z ZADANIA ---
         cols_zadan = [c for c in df.columns if 'zadan' in c.lower()]
         if cols_zadan:
             df['Zadanie_Raw'] = df[cols_zadan[0]].astype(str).str.strip()
-            # Wyciągamy końcówkę (np. wyciągnie '25' z tekstu '_Poz25')
             df['Pozycja_z_Zadania'] = df['Zadanie_Raw'].str.extract(r'_(?i:Poz)(\d{1,6})$', expand=False).fillna("")
-            # Czyścimy Zadanie odcinając '_Poz25' - do słownika trafia czysta nazwa!
             df['Zadanie'] = df['Zadanie_Raw'].str.replace(r'_(?i:Poz)\d{1,6}$', '', regex=True).str.strip()
         else:
             df['Zadanie'] = ""
             df['Pozycja_z_Zadania'] = ""
             
-        # Zabezpieczenie: jeśli ktoś zostawi w Excelu osobną kolumnę "Pozycja"
         if 'Pozycja' in df.columns:
             df['Pozycja_kolumna'] = df['Pozycja'].astype(str).str.strip().apply(lambda x: "" if x.lower() in ['nan', 'none', ''] else sanitize_xml(x)[:6])
-            # Priorytet: użyj kolumny "Pozycja" jeśli istnieje i nie jest pusta, w przeciwnym razie użyj wyciętej z Zadania
             df['Pozycja_klas'] = df['Pozycja_kolumna'].where(df['Pozycja_kolumna'] != "", df['Pozycja_z_Zadania'])
         else:
             df['Pozycja_klas'] = df['Pozycja_z_Zadania']
