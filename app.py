@@ -142,7 +142,6 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     root = ET.Element("Plan", wersja="1.0")
     typ_xml_node = ET.SubElement(root, typ_str)
     
-    # Przygotowanie OPISU głównego (<200 znaków) złączonego z Uzasadnieniem
     if 'Uzasadnienie' in data_frame.columns:
         uzas_list = data_frame['Uzasadnienie'].fillna('').astype(str).str.strip()
         valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
@@ -152,7 +151,6 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         uzasadnienie_raw = doc_params['uzasadnienie']
 
-    # Łączymy w jeden tekst i ucinamy do MAX_OPIS_LEN (199 znaków, bo XSD pozwala na 200)
     if uzasadnienie_raw:
         combined_text = f"{doc_params['opis']} - {uzasadnienie_raw}"
     else:
@@ -199,7 +197,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
         
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
     
-    group_cols = ['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean', 'Sposob_finansowania', 'Zad_Sys']
+    group_cols = ['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean', 'Pozycja_klas', 'Sposob_finansowania', 'Zad_Sys']
     
     before_drop = len(df_sorted)
     df_sorted = df_sorted.dropna(subset=['Dzial_clean', 'Rozdzial_clean', 'Paragraf_clean'])
@@ -210,8 +208,9 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     merged_groups = group_sizes[group_sizes > 1]
     for name, count in merged_groups.items():
         if len(stats['merged_details']) < 500: 
-            dz, ro, pa, sf, zs = name
-            stats['merged_details'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa} -> skompresowano {count} wiersze do salda.")
+            dz, ro, pa, poz, sf, zs = name
+            poz_str = f" Poz:{poz}" if poz else ""
+            stats['merged_details'].append(f"{unit_name} | Dz:{dz} Rozdz:{ro} Par:{pa}{poz_str} -> skompresowano {count} wiersze do salda.")
 
     df_grouped = df_sorted.groupby(group_cols, as_index=False)['Zmiana_num'].sum()
     stats['audit_after'] += len(df_grouped)
@@ -225,6 +224,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     lp = 1
     for row in df_grouped.itertuples(index=False):
         dz, ro, pa = row.Dzial_clean, row.Rozdzial_clean, row.Paragraf_clean
+        poz_klas = getattr(row, 'Pozycja_klas', '') 
         kwota_grosze = getattr(row, 'Zmiana_num', None)
         zad_sys = row.Zad_Sys
         sposob_fin = str(row.Sposob_finansowania).strip()
@@ -251,7 +251,7 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
         ET.SubElement(dok_node, "Pozycja", 
                       Dysponent=bezpieczny_dysponent, SposobFinansowania=sanitize_xml(sposob_fin, "Sposób finansowania", stats), 
                       Dzial=dz, Rozdzial=ro, Paragraf=pa, 
-                      Pozycja="", Zadanie=zad_sys, 
+                      Pozycja=poz_klas, Zadanie=zad_sys, 
                       Data=doc_params['data_dok'], Lp=str(lp), Plan=f"{kwota_zl:.2f}")
         lp += 1
     
@@ -312,6 +312,11 @@ d_params = {'nr_dok': d_nr, 'data_dok': d_date.strftime("%Y-%m-%d"),
             'opis': d_opis, 'uzasadnienie': d_uzas}
 
 st.title("🚀 Generator XML dla Rekord SI")
+st.markdown("""
+**💡 Wskazówka dla Pozycji Inwestycyjnych:**
+Jeśli chcesz przypisać **Pozycję** w Rekordzie (np. przy Budżecie Obywatelskim), po prostu dopisz do nazwy zadania w Excelu końcówkę `_Poz` i numer. 
+*Przykład:* wpisanie `BO_2026_Poz25` sprawi, że XML otrzyma zadanie `BO_2026` oraz pozycję `25`.
+""")
 
 f = st.file_uploader("Wgraj Excel (arkusze: Zmiany, Słowniki)", type="xlsx")
 
@@ -349,15 +354,30 @@ if f:
             df['Dzial_clean'] = df['Rozdzial_clean'].str[:3]
         
         df['Paragraf_clean'] = df['§'].apply(lambda x: clean_id(x, 4, strict_mode))
+        
+        # --- NOWE: MAGIA EKSTRAKCJI POZYCJI Z ZADANIA ---
+        cols_zadan = [c for c in df.columns if 'zadan' in c.lower()]
+        if cols_zadan:
+            df['Zadanie_Raw'] = df[cols_zadan[0]].astype(str).str.strip()
+            # Wyciągamy końcówkę (np. wyciągnie '25' z tekstu '_Poz25')
+            df['Pozycja_z_Zadania'] = df['Zadanie_Raw'].str.extract(r'_(?i:Poz)(\d{1,6})$', expand=False).fillna("")
+            # Czyścimy Zadanie odcinając '_Poz25' - do słownika trafia czysta nazwa!
+            df['Zadanie'] = df['Zadanie_Raw'].str.replace(r'_(?i:Poz)\d{1,6}$', '', regex=True).str.strip()
+        else:
+            df['Zadanie'] = ""
+            df['Pozycja_z_Zadania'] = ""
+            
+        # Zabezpieczenie: jeśli ktoś zostawi w Excelu osobną kolumnę "Pozycja"
+        if 'Pozycja' in df.columns:
+            df['Pozycja_kolumna'] = df['Pozycja'].astype(str).str.strip().apply(lambda x: "" if x.lower() in ['nan', 'none', ''] else sanitize_xml(x)[:6])
+            # Priorytet: użyj kolumny "Pozycja" jeśli istnieje i nie jest pusta, w przeciwnym razie użyj wyciętej z Zadania
+            df['Pozycja_klas'] = df['Pozycja_kolumna'].where(df['Pozycja_kolumna'] != "", df['Pozycja_z_Zadania'])
+        else:
+            df['Pozycja_klas'] = df['Pozycja_z_Zadania']
+            
         df['Zmiana_num'] = df['Zmiana'].apply(lambda x: parse_kwota(x, strict_mode)).astype(pd.Int64Dtype())
         df['Jednostka_clean'] = df['Jednostka'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True)
         
-        cols_zadan = [c for c in df.columns if 'zadan' in c.lower()]
-        if cols_zadan:
-            df['Zadanie'] = df[cols_zadan[0]]
-        else:
-            df['Zadanie'] = ""
-            
         errors = []
         df_valid = df[df['Jednostka_clean'].notna() & (df['Jednostka_clean'] != '') & (df['Jednostka_clean'] != 'nan')].copy()
         
@@ -407,14 +427,12 @@ if f:
         }
         preview = ""
         
-        # --- NOWOŚĆ: Lista do zbierania uzasadnień dla pliku TXT ---
         uzasadnienia_raport = []
 
         with zipfile.ZipFile(z_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for unit in units:
                 u_df = df_valid[df_valid['Jednostka_clean'] == unit]
                 
-                # Zbierz unikalne uzasadnienia z całej jednostki (Dochody + Wydatki)
                 unit_uzas = ""
                 if 'Uzasadnienie' in u_df.columns:
                     uzas_list = u_df['Uzasadnienie'].fillna('').astype(str).str.strip()
@@ -422,14 +440,11 @@ if f:
                     if valid_uzas:
                         unit_uzas = " | ".join(valid_uzas)
                 
-                # Jeśli w Excelu było puste, użyj domyślnego z lewego panelu
                 if not unit_uzas:
                     unit_uzas = d_uzas
                 
-                # Format wymagany przez użytkownika
                 uzasadnienia_raport.append(f"[{unit}]:\n{unit_uzas}\n")
                 
-                # Generowanie XML-i Dochody/Wydatki
                 for t in sorted(x for x in u_df['Typ_DW_norm'].unique() if x in ['Dochody', 'Wydatki']):
                     sub = u_df[u_df['Typ_DW_norm'] == t].reset_index(drop=True)
                     xml = create_xml(sub, d_params, unit, mapping, t, stats, typ_zmiany_opcja, podstawa_opcja)
@@ -444,7 +459,6 @@ if f:
                     used_names.add(fname)
                     zf.writestr(fname, xml.encode('utf-8'))
             
-            # --- NOWOŚĆ: Dodajemy wygenerowany raport tekstowy do paczki ZIP ---
             if uzasadnienia_raport:
                 txt_content = "\n".join(uzasadnienia_raport)
                 zf.writestr("Zbiorcze_Uzasadnienia.txt", txt_content.encode('utf-8'))
