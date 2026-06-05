@@ -8,6 +8,7 @@ import re
 import unicodedata
 import hashlib
 import time
+import fitz  # DODANO: PyMuPDF do obsługi PDF
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
@@ -20,7 +21,7 @@ ERROR_AMOUNT_THRESHOLD = 100_000_000_000   # 100 miliardów złotych
 # Globalna kompilacja regexu XML
 XML_CLEAN_RE = re.compile(r'[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]')
 
-# --- FUNKCJE POMOCNICZE ---
+# --- FUNKCJE POMOCNICZE (XML i czyszczenie danych) ---
 
 def sanitize_xml(text, context=None, stats=None):
     if pd.isna(text) or text is None:
@@ -135,7 +136,7 @@ def load_mapping_dict(uploaded_file):
 def format_pln(amount):
     return f"{float(amount):,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
 
-# --- GŁÓWNA FUNKCJA GENERUJĄCA XML ---
+# --- FUNKCJA GENERUJĄCA XML ---
 def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, typ_zmiany_val, podstawa_opcja):
     if data_frame.empty: return ""
         
@@ -195,13 +196,11 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     else:
         df_sorted['Zad_Sys_Raw'] = "000000000"
         
-    # --- NOWE: Wyciągamy ewentualną pozycję ze Słownika (z Zad_Sys_Raw) ---
     extracted_poz = df_sorted['Zad_Sys_Raw'].str.extract(r'(?i)_poz(\d{1,6})$', expand=False).fillna("")
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys_Raw'].str.replace(r'(?i)_poz\d{1,6}$', '', regex=True).str.strip()
     df_sorted['Zad_Sys'] = df_sorted['Zad_Sys'].apply(lambda x: sanitize_xml(str(x)[:MAX_ZAD_LEN], "Zadanie", stats))
     
     if 'Pozycja_klas' in df_sorted.columns:
-        # Nadpisujemy pozycję wartością ze Słownika (jeśli tam była)
         df_sorted['Pozycja_klas'] = extracted_poz.where(extracted_poz != "", df_sorted['Pozycja_klas'])
     else:
         df_sorted['Pozycja_klas'] = extracted_poz
@@ -276,9 +275,47 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
         
     return re.sub(r'<\?xml[^>]+\?>', '<?xml version="1.0" encoding="UTF-8"?>', xml_str)
 
+# --- DODANO: FUNKCJA DO SCALANIA PDF ---
+def generuj_pdf_z_kopiami(lista_plikow):
+    master_doc = fitz.open()
+
+    # Faza 1: Scalanie oryginałów
+    for plik in lista_plikow:
+        plik.seek(0)
+        doc_oryginal = fitz.open("pdf", plik.read())
+        master_doc.insert_pdf(doc_oryginal)
+        doc_oryginal.close()
+
+    # Faza 2: Generowanie i scalanie kopii
+    for plik in lista_plikow:
+        plik.seek(0)
+        doc_kopia = fitz.open("pdf", plik.read())
+        
+        for strona in doc_kopia:
+            szerokosc_strony = strona.rect.width
+            pozycja_naglowka = fitz.Point(szerokosc_strony - 100, 40)
+            
+            strona.insert_text(
+                point=pozycja_naglowka,
+                text="KOPIA",
+                fontsize=18,
+                color=(0.6, 0.6, 0.6),
+                fontname="helv",
+                overlay=True
+            )
+            
+        master_doc.insert_pdf(doc_kopia)
+        doc_kopia.close()
+
+    bufor_wyjsciowy = io.BytesIO()
+    master_doc.save(bufor_wyjsciowy)
+    master_doc.close()
+    
+    bufor_wyjsciowy.seek(0)
+    return bufor_wyjsciowy
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="Konwerter Budżetowy Rekord", layout="wide")
+st.set_page_config(page_title="Narzędzia Budżetowe Rekord", layout="wide")
 
 st.sidebar.header("📝 Dane Dokumentu")
 d_date = st.sidebar.date_input("Data dokumentu", datetime.today())
@@ -320,208 +357,244 @@ d_params = {'nr_dok': d_nr, 'data_dok': d_date.strftime("%Y-%m-%d"),
             'rok': str(d_date.year), 'mc': str(d_date.month), 
             'opis': d_opis, 'uzasadnienie': d_uzas}
 
-st.title("🚀 Generator XML dla Rekord SI", help="Wskazówka dla Pozycji budżetowych:\nJeśli chcesz przypisać Pozycję w Rekordzie (np. przy Budżecie Obywatelskim), dopisz końcówkę _Poz i numer do nazwy zadania w arkuszu Zmiany LUB w Słowniku (w kolumnie Nazwa_Systemowa). Przykład: wpisanie BO_2026_Poz25 sprawi, że XML otrzyma zadanie BO_2026 oraz pozycję 25.")
+st.title("🚀 Narzędzia Budżetowe Rekord SI")
 
-f = st.file_uploader("Wgraj Excel (arkusze: Zmiany, Słowniki)", type="xlsx")
+# DODANO: Zakładki organizujące aplikację
+tab1, tab2 = st.tabs(["📊 Generator XML z Excela", "🖨️ Przygotowanie Wydruków PDF (Oryginał + Kopia)"])
 
-if f:
-    start_time = time.time()
-    mapping = load_mapping_dict(f)
-    if mapping.get("dysponent"):
-        st.sidebar.success(f"Wczytano słownik: {len(mapping['dysponent'])} jednostek, {len(mapping['zadanie'])} zadań.")
-    
-    try:
-        f.seek(0)
-        df = pd.read_excel(f, sheet_name='Zmiany')
-        df.columns = df.columns.str.strip()
+with tab1:
+    st.info("Wskazówka dla Pozycji budżetowych:\nJeśli chcesz przypisać Pozycję w Rekordzie (np. przy Budżecie Obywatelskim), dopisz końcówkę _Poz i numer do nazwy zadania w arkuszu Zmiany LUB w Słowniku (w kolumnie Nazwa_Systemowa). Przykład: wpisanie BO_2026_Poz25 sprawi, że XML otrzyma zadanie BO_2026 oraz pozycję 25.")
+
+    f = st.file_uploader("Wgraj Excel (arkusze: Zmiany, Słowniki)", type="xlsx")
+
+    if f:
+        start_time = time.time()
+        mapping = load_mapping_dict(f)
+        if mapping.get("dysponent"):
+            st.sidebar.success(f"Wczytano słownik: {len(mapping['dysponent'])} jednostek, {len(mapping['zadanie'])} zadań.")
         
-        required_cols = ['Typ D/W', 'Rozdział', '§', 'Jednostka', 'Zmiana']
-        missing_cols = [c for c in required_cols if c not in df.columns]
-        if missing_cols:
-            st.error(f"🛑 BŁĄD: W arkuszu 'Zmiany' brakuje wymaganych kolumn: {', '.join(missing_cols)}")
-            st.info("Upewnij się, że nagłówki w Excelu są poprawne i nie zawierają literówek.")
-            st.stop()
-        
-        type_map = {
-            'dochody': 'Dochody', 'dochód': 'Dochody', 'doch': 'Dochody', 'd': 'Dochody', 'dw': 'Dochody',
-            'wydatki': 'Wydatki', 'wydatek': 'Wydatki', 'wyd': 'Wydatki', 'w': 'Wydatki', 'wd': 'Wydatki'
-        }
-        cleaned_typ = df['Typ D/W'].astype(str).str.lower().str.replace(r'[^a-ząćęłńóśżź]', '', regex=True)
-        df['Typ_DW_norm'] = cleaned_typ.map(type_map).fillna("BŁĄD")
-        
-        df['Rozdzial_clean'] = df['Rozdział'].apply(lambda x: clean_id(x, 5, strict_mode))
-        
-        if 'Dział' in df.columns:
-            dzial_z_kolumny = df['Dział'].apply(lambda x: clean_id(x, 3, strict_mode))
-            df['Dzial_clean'] = dzial_z_kolumny.fillna(df['Rozdzial_clean'].str[:3])
-        else:
-            df['Dzial_clean'] = df['Rozdzial_clean'].str[:3]
-        
-        df['Paragraf_clean'] = df['§'].apply(lambda x: clean_id(x, 4, strict_mode))
-        
-        cols_zadan = [c for c in df.columns if 'zadan' in c.lower()]
-        if cols_zadan:
-            df['Zadanie_Raw'] = df[cols_zadan[0]].astype(str).str.strip()
-            df['Pozycja_z_Zadania'] = df['Zadanie_Raw'].str.extract(r'(?i)_poz(\d{1,6})$', expand=False).fillna("")
-            df['Zadanie'] = df['Zadanie_Raw'].str.replace(r'(?i)_poz\d{1,6}$', '', regex=True).str.strip()
-        else:
-            df['Zadanie'] = ""
-            df['Pozycja_z_Zadania'] = ""
+        try:
+            f.seek(0)
+            df = pd.read_excel(f, sheet_name='Zmiany')
+            df.columns = df.columns.str.strip()
             
-        if 'Pozycja' in df.columns:
-            df['Pozycja_kolumna'] = df['Pozycja'].astype(str).str.strip().apply(lambda x: "" if x.lower() in ['nan', 'none', ''] else sanitize_xml(x)[:6])
-            df['Pozycja_klas'] = df['Pozycja_kolumna'].where(df['Pozycja_kolumna'] != "", df['Pozycja_z_Zadania'])
-        else:
-            df['Pozycja_klas'] = df['Pozycja_z_Zadania']
+            required_cols = ['Typ D/W', 'Rozdział', '§', 'Jednostka', 'Zmiana']
+            missing_cols = [c for c in required_cols if c not in df.columns]
+            if missing_cols:
+                st.error(f"🛑 BŁĄD: W arkuszu 'Zmiany' brakuje wymaganych kolumn: {', '.join(missing_cols)}")
+                st.info("Upewnij się, że nagłówki w Excelu są poprawne i nie zawierają literówek.")
+                st.stop()
             
-        df['Zmiana_num'] = df['Zmiana'].apply(lambda x: parse_kwota(x, strict_mode)).astype(pd.Int64Dtype())
-        df['Jednostka_clean'] = df['Jednostka'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True)
-        
-        errors = []
-        df_valid = df[df['Jednostka_clean'].notna() & (df['Jednostka_clean'] != '') & (df['Jednostka_clean'] != 'nan')].copy()
-        
-        for row in df_valid.itertuples():
-            r_num = row.Index + 2
-            u = str(getattr(row, 'Jednostka_clean', 'Brak'))
+            type_map = {
+                'dochody': 'Dochody', 'dochód': 'Dochody', 'doch': 'Dochody', 'd': 'Dochody', 'dw': 'Dochody',
+                'wydatki': 'Wydatki', 'wydatek': 'Wydatki', 'wyd': 'Wydatki', 'w': 'Wydatki', 'wd': 'Wydatki'
+            }
+            cleaned_typ = df['Typ D/W'].astype(str).str.lower().str.replace(r'[^a-ząćęłńóśżź]', '', regex=True)
+            df['Typ_DW_norm'] = cleaned_typ.map(type_map).fillna("BŁĄD")
             
-            if u.isdigit(): errors.append(f"Wiersz {r_num}: Jednostka musi mieć nazwę tekstową ('{u}').")
-                
-            dz = str(getattr(row, 'Dzial_clean', ''))
-            ro = str(getattr(row, 'Rozdzial_clean', ''))
-            pa = str(getattr(row, 'Paragraf_clean', ''))
-            kwota_grosze = getattr(row, 'Zmiana_num', pd.NA)
+            df['Rozdzial_clean'] = df['Rozdział'].apply(lambda x: clean_id(x, 5, strict_mode))
             
-            if getattr(row, 'Typ_DW_norm', '') == "BŁĄD": 
-                errors.append(f"Wiersz {r_num} ({u}): Nierozpoznany Typ D/W.")
-            if not dz or len(dz) != 3 or not dz.isdigit(): 
-                errors.append(f"Wiersz {r_num} ({u}): Dział musi mieć 3 cyfry (bez znaków specjalnych).")
-            if not ro or len(ro) != 5 or not ro.isdigit(): 
-                errors.append(f"Wiersz {r_num} ({u}): Rozdział musi mieć 5 cyfr.")
-            if not pa or len(pa) != 4 or not pa.isdigit(): 
-                errors.append(f"Wiersz {r_num} ({u}): Paragraf musi mieć dokładnie 4 cyfry.")
-                
-            if pd.isna(kwota_grosze): 
-                errors.append(f"Wiersz {r_num} ({u}): Kwota '{getattr(row, 'Zmiana', '')}' jest nieczytelna (Tryb Strict: {strict_mode}).")
-            elif abs(Decimal(int(kwota_grosze)) / 100) > ERROR_AMOUNT_THRESHOLD:
-                errors.append(f"Wiersz {r_num} ({u}): BŁĄD KRYTYCZNY! Kwota {format_pln(int(kwota_grosze) / 100.0)} zł przekracza limit.")
-
-        if errors:
-            st.error(f"🚨 Znaleziono {len(errors)} błędów blokujących generowanie plików.")
-            st.download_button("⬇️ Pobierz pełny raport błędów", "\n".join(errors), "bledy.txt")
-            for e in errors[:50]: st.write(f"❌ {e}")
-            if len(errors) > 50: st.info(f"...oraz {len(errors) - 50} więcej. Pobierz raport .txt.")
-            st.stop()
-
-        bilans_grosze = pd.to_numeric(df_valid['Zmiana_num'], errors='coerce').dropna().astype('int64').sum()
-        bilans_zl = Decimal(int(bilans_grosze)) / 100
-        
-        units = sorted(df_valid['Jednostka_clean'].unique())
-        z_buf, used_names = io.BytesIO(), set()
-        
-        stats = {
-            'skipped_zeros': 0, 'runtime_errors_count': 0, 'runtime_errors_list': [], 
-            'audit_before': 0, 'audit_after': 0, 'sanitized_chars': 0,
-            'sanitized_details': set(), 'suspicious_amounts': 0, 'suspicious_list': [],
-            'dropped_na': 0, 'merged_details': [], 'unknown_tasks': set()
-        }
-        preview = ""
-        
-        uzasadnienia_raport = []
-
-        with zipfile.ZipFile(z_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for unit in units:
-                u_df = df_valid[df_valid['Jednostka_clean'] == unit]
-                
-                unit_uzas = ""
-                if 'Uzasadnienie' in u_df.columns:
-                    uzas_list = u_df['Uzasadnienie'].fillna('').astype(str).str.strip()
-                    valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
-                    if valid_uzas:
-                        unit_uzas = " | ".join(valid_uzas)
-                
-                if not unit_uzas:
-                    unit_uzas = d_uzas
-                
-                uzasadnienia_raport.append(f"[{unit}]:\n{unit_uzas}\n")
-                
-                for t in sorted(x for x in u_df['Typ_DW_norm'].unique() if x in ['Dochody', 'Wydatki']):
-                    sub = u_df[u_df['Typ_DW_norm'] == t].reset_index(drop=True)
-                    xml = create_xml(sub, d_params, unit, mapping, t, stats, typ_zmiany_opcja, podstawa_opcja)
-                    if not xml: continue 
-                    if not preview: preview = xml
-                    
-                    fname = f"Plan_{normalize_filename(unit)}_{t}.xml"
-                    c = 1
-                    while fname in used_names:
-                        fname = f"Plan_{normalize_filename(unit)}_{t}_{c}.xml"
-                        c += 1
-                    used_names.add(fname)
-                    zf.writestr(fname, xml.encode('utf-8'))
-            
-            if uzasadnienia_raport:
-                txt_content = "\n".join(uzasadnienia_raport)
-                zf.writestr("Zbiorcze_Uzasadnienia.txt", txt_content.encode('utf-8'))
-
-        if not used_names:
-            st.warning("⚠️ Brak danych do wygenerowania. System usunął puste pola i wyzerowane kwoty.")
-            st.stop()
-
-        st.success(f"Sukces! Wygenerowano {len(used_names)} dokumentów XML oraz 1 plik TXT z uzasadnieniami dla {len(units)} jednostek. ✅")
-        
-        if stats['unknown_tasks']:
-            st.warning(f"⚠️ UWAGA: Znaleziono {len(stats['unknown_tasks'])} opisów zadań z Excela, których nie ma w Słowniku. W pliku XML ich kody przyjmą wartość 000000000.")
-            with st.expander("Kliknij, aby zobaczyć niezidentyfikowane opisy zadań"):
-                for t_name in sorted(list(stats['unknown_tasks']))[:20]:
-                    st.write(f"- {t_name}")
-                if len(stats['unknown_tasks']) > 20: st.write("...i więcej.")
-
-        if bilans_grosze == 0:
-            st.info("⚖️ Bilans zmian (globalny) wynosi **0,00 zł** (Idealnie zbilansowane przesunięcie budżetowe).")
-        else:
-            st.info(f"📈 Bilans zmian (globalny) wynosi: **{format_pln(bilans_zl)} zł** (Zmiana wielkości budżetu).")
-
-        with st.expander("📊 Wyświetl bilans zmian dla poszczególnych jednostek"):
-            bilans_jednostek = pd.to_numeric(df_valid['Zmiana_num'], errors='coerce').groupby(df_valid['Jednostka_clean']).sum()
-            for j_name, j_grosze in bilans_jednostek.items():
-                if pd.isna(j_grosze): j_grosze = 0
-                j_zl = Decimal(int(j_grosze)) / 100
-                if j_grosze == 0: st.write(f"- {j_name}: **0,00 zł** 🟢")
-                else: st.write(f"- {j_name}: **{format_pln(j_zl)} zł** 🔵")
-        
-        if stats['suspicious_amounts'] > 0:
-            st.error(f"🚨 WYKRYTO ZAGROŻENIE: Znaleziono {stats['suspicious_amounts']} kwot pow. {format_pln(WARN_AMOUNT_THRESHOLD)} zł.")
-            with st.expander("Szczegóły podejrzanych kwot"):
-                for s_item in stats['suspicious_list'][:10]: st.write(f"- {s_item}")
-
-        if stats['dropped_na'] > 0:
-            st.error(f"🚨 ODRZUCONO DANE: Usunięto **{stats['dropped_na']}** wierszy z powodu braku kodów klasyfikacji. Sprawdź plik!")
-
-        if audit_mode:
-            if stats['audit_before'] > stats['audit_after']:
-                st.info(f"🔍 **Tryb Audytu JST:** Zoptymalizowano liczbę wierszy z **{stats['audit_before']}** (Excel) do **{stats['audit_after']}** (XML). Zsumowano {stats['audit_before'] - stats['audit_after']} powiązanych ze sobą operacji.")
-                if stats['merged_details']:
-                    with st.expander("Zobacz detale skompresowanych podziałek budżetowych"):
-                        for m_item in stats['merged_details'][:15]: st.write(f"- {m_item}")
-                        if len(stats['merged_details']) > 15: st.write("*...i więcej.*")
+            if 'Dział' in df.columns:
+                dzial_z_kolumny = df['Dział'].apply(lambda x: clean_id(x, 3, strict_mode))
+                df['Dzial_clean'] = dzial_z_kolumny.fillna(df['Rozdzial_clean'].str[:3])
             else:
-                st.info("🔍 **Tryb Audytu JST:** Nie wykryto wpisów w tej samej klasyfikacji wymagających sumowania.")
-
-        if stats['sanitized_chars'] > 0:
-            st.warning(f"🧹 Usunięto **{stats['sanitized_chars']}** znaków specjalnych niedozwolonych przez standard XML 1.0.")
-            with st.expander("Zlokalizowane w:"):
-                for detail in list(stats['sanitized_details'])[:5]: st.write(f"- {detail}")
-
-        if stats['skipped_zeros'] > 0: 
-            st.info(f"ℹ️ Zoptymalizowano (zsumowano do 0.00 lub pominięto): {stats['skipped_zeros']} pozycji.")
+                df['Dzial_clean'] = df['Rozdzial_clean'].str[:3]
             
-        st.divider()
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button("📦 Pobierz paczkę ZIP", z_buf.getvalue(), 
-                               f"Eksport_Rekord_{d_date.strftime('%Y%m%d')}.zip", "application/zip", use_container_width=True)
-        
-        with st.expander("🔍 Podgląd pierwszego wygenerowanego dokumentu XML"): st.code(preview, "xml")
-        
-        st.caption(f"⏱️ Czas generowania: {round(time.time() - start_time, 2)} s | Wczytano i przetworzono {len(df)} wierszy źródłowych.")
+            df['Paragraf_clean'] = df['§'].apply(lambda x: clean_id(x, 4, strict_mode))
             
-    except Exception as e: st.error(f"Błąd krytyczny aplikacji: {e}")
+            cols_zadan = [c for c in df.columns if 'zadan' in c.lower()]
+            if cols_zadan:
+                df['Zadanie_Raw'] = df[cols_zadan[0]].astype(str).str.strip()
+                df['Pozycja_z_Zadania'] = df['Zadanie_Raw'].str.extract(r'(?i)_poz(\d{1,6})$', expand=False).fillna("")
+                df['Zadanie'] = df['Zadanie_Raw'].str.replace(r'(?i)_poz\d{1,6}$', '', regex=True).str.strip()
+            else:
+                df['Zadanie'] = ""
+                df['Pozycja_z_Zadania'] = ""
+                
+            if 'Pozycja' in df.columns:
+                df['Pozycja_kolumna'] = df['Pozycja'].astype(str).str.strip().apply(lambda x: "" if x.lower() in ['nan', 'none', ''] else sanitize_xml(x)[:6])
+                df['Pozycja_klas'] = df['Pozycja_kolumna'].where(df['Pozycja_kolumna'] != "", df['Pozycja_z_Zadania'])
+            else:
+                df['Pozycja_klas'] = df['Pozycja_z_Zadania']
+                
+            df['Zmiana_num'] = df['Zmiana'].apply(lambda x: parse_kwota(x, strict_mode)).astype(pd.Int64Dtype())
+            df['Jednostka_clean'] = df['Jednostka'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True)
+            
+            errors = []
+            df_valid = df[df['Jednostka_clean'].notna() & (df['Jednostka_clean'] != '') & (df['Jednostka_clean'] != 'nan')].copy()
+            
+            for row in df_valid.itertuples():
+                r_num = row.Index + 2
+                u = str(getattr(row, 'Jednostka_clean', 'Brak'))
+                
+                if u.isdigit(): errors.append(f"Wiersz {r_num}: Jednostka musi mieć nazwę tekstową ('{u}').")
+                    
+                dz = str(getattr(row, 'Dzial_clean', ''))
+                ro = str(getattr(row, 'Rozdzial_clean', ''))
+                pa = str(getattr(row, 'Paragraf_clean', ''))
+                kwota_grosze = getattr(row, 'Zmiana_num', pd.NA)
+                
+                if getattr(row, 'Typ_DW_norm', '') == "BŁĄD": 
+                    errors.append(f"Wiersz {r_num} ({u}): Nierozpoznany Typ D/W.")
+                if not dz or len(dz) != 3 or not dz.isdigit(): 
+                    errors.append(f"Wiersz {r_num} ({u}): Dział musi mieć 3 cyfry (bez znaków specjalnych).")
+                if not ro or len(ro) != 5 or not ro.isdigit(): 
+                    errors.append(f"Wiersz {r_num} ({u}): Rozdział musi mieć 5 cyfr.")
+                if not pa or len(pa) != 4 or not pa.isdigit(): 
+                    errors.append(f"Wiersz {r_num} ({u}): Paragraf musi mieć dokładnie 4 cyfry.")
+                    
+                if pd.isna(kwota_grosze): 
+                    errors.append(f"Wiersz {r_num} ({u}): Kwota '{getattr(row, 'Zmiana', '')}' jest nieczytelna (Tryb Strict: {strict_mode}).")
+                elif abs(Decimal(int(kwota_grosze)) / 100) > ERROR_AMOUNT_THRESHOLD:
+                    errors.append(f"Wiersz {r_num} ({u}): BŁĄD KRYTYCZNY! Kwota {format_pln(int(kwota_grosze) / 100.0)} zł przekracza limit.")
+
+            if errors:
+                st.error(f"🚨 Znaleziono {len(errors)} błędów blokujących generowanie plików.")
+                st.download_button("⬇️ Pobierz pełny raport błędów", "\n".join(errors), "bledy.txt")
+                for e in errors[:50]: st.write(f"❌ {e}")
+                if len(errors) > 50: st.info(f"...oraz {len(errors) - 50} więcej. Pobierz raport .txt.")
+                st.stop()
+
+            bilans_grosze = pd.to_numeric(df_valid['Zmiana_num'], errors='coerce').dropna().astype('int64').sum()
+            bilans_zl = Decimal(int(bilans_grosze)) / 100
+            
+            units = sorted(df_valid['Jednostka_clean'].unique())
+            z_buf, used_names = io.BytesIO(), set()
+            
+            stats = {
+                'skipped_zeros': 0, 'runtime_errors_count': 0, 'runtime_errors_list': [], 
+                'audit_before': 0, 'audit_after': 0, 'sanitized_chars': 0,
+                'sanitized_details': set(), 'suspicious_amounts': 0, 'suspicious_list': [],
+                'dropped_na': 0, 'merged_details': [], 'unknown_tasks': set()
+            }
+            preview = ""
+            
+            uzasadnienia_raport = []
+
+            with zipfile.ZipFile(z_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for unit in units:
+                    u_df = df_valid[df_valid['Jednostka_clean'] == unit]
+                    
+                    unit_uzas = ""
+                    if 'Uzasadnienie' in u_df.columns:
+                        uzas_list = u_df['Uzasadnienie'].fillna('').astype(str).str.strip()
+                        valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
+                        if valid_uzas:
+                            unit_uzas = " | ".join(valid_uzas)
+                    
+                    if not unit_uzas:
+                        unit_uzas = d_uzas
+                    
+                    uzasadnienia_raport.append(f"[{unit}]:\n{unit_uzas}\n")
+                    
+                    for t in sorted(x for x in u_df['Typ_DW_norm'].unique() if x in ['Dochody', 'Wydatki']):
+                        sub = u_df[u_df['Typ_DW_norm'] == t].reset_index(drop=True)
+                        xml = create_xml(sub, d_params, unit, mapping, t, stats, typ_zmiany_opcja, podstawa_opcja)
+                        if not xml: continue 
+                        if not preview: preview = xml
+                        
+                        fname = f"Plan_{normalize_filename(unit)}_{t}.xml"
+                        c = 1
+                        while fname in used_names:
+                            fname = f"Plan_{normalize_filename(unit)}_{t}_{c}.xml"
+                            c += 1
+                        used_names.add(fname)
+                        zf.writestr(fname, xml.encode('utf-8'))
+                
+                if uzasadnienia_raport:
+                    txt_content = "\n".join(uzasadnienia_raport)
+                    zf.writestr("Zbiorcze_Uzasadnienia.txt", txt_content.encode('utf-8'))
+
+            if not used_names:
+                st.warning("⚠️ Brak danych do wygenerowania. System usunął puste pola i wyzerowane kwoty.")
+                st.stop()
+
+            st.success(f"Sukces! Wygenerowano {len(used_names)} dokumentów XML oraz 1 plik TXT z uzasadnieniami dla {len(units)} jednostek. ✅")
+            
+            if stats['unknown_tasks']:
+                st.warning(f"⚠️ UWAGA: Znaleziono {len(stats['unknown_tasks'])} opisów zadań z Excela, których nie ma w Słowniku. W pliku XML ich kody przyjmą wartość 000000000.")
+                with st.expander("Kliknij, aby zobaczyć niezidentyfikowane opisy zadań"):
+                    for t_name in sorted(list(stats['unknown_tasks']))[:20]:
+                        st.write(f"- {t_name}")
+                    if len(stats['unknown_tasks']) > 20: st.write("...i więcej.")
+
+            if bilans_grosze == 0:
+                st.info("⚖️ Bilans zmian (globalny) wynosi **0,00 zł** (Idealnie zbilansowane przesunięcie budżetowe).")
+            else:
+                st.info(f"📈 Bilans zmian (globalny) wynosi: **{format_pln(bilans_zl)} zł** (Zmiana wielkości budżetu).")
+
+            with st.expander("📊 Wyświetl bilans zmian dla poszczególnych jednostek"):
+                bilans_jednostek = pd.to_numeric(df_valid['Zmiana_num'], errors='coerce').groupby(df_valid['Jednostka_clean']).sum()
+                for j_name, j_grosze in bilans_jednostek.items():
+                    if pd.isna(j_grosze): j_grosze = 0
+                    j_zl = Decimal(int(j_grosze)) / 100
+                    if j_grosze == 0: st.write(f"- {j_name}: **0,00 zł** 🟢")
+                    else: st.write(f"- {j_name}: **{format_pln(j_zl)} zł** 🔵")
+            
+            if stats['suspicious_amounts'] > 0:
+                st.error(f"🚨 WYKRYTO ZAGROŻENIE: Znaleziono {stats['suspicious_amounts']} kwot pow. {format_pln(WARN_AMOUNT_THRESHOLD)} zł.")
+                with st.expander("Szczegóły podejrzanych kwot"):
+                    for s_item in stats['suspicious_list'][:10]: st.write(f"- {s_item}")
+
+            if stats['dropped_na'] > 0:
+                st.error(f"🚨 ODRZUCONO DANE: Usunięto **{stats['dropped_na']}** wierszy z powodu braku kodów klasyfikacji. Sprawdź plik!")
+
+            if audit_mode:
+                if stats['audit_before'] > stats['audit_after']:
+                    st.info(f"🔍 **Tryb Audytu JST:** Zoptymalizowano liczbę wierszy z **{stats['audit_before']}** (Excel) do **{stats['audit_after']}** (XML). Zsumowano {stats['audit_before'] - stats['audit_after']} powiązanych ze sobą operacji.")
+                    if stats['merged_details']:
+                        with st.expander("Zobacz detale skompresowanych podziałek budżetowych"):
+                            for m_item in stats['merged_details'][:15]: st.write(f"- {m_item}")
+                            if len(stats['merged_details']) > 15: st.write("*...i więcej.*")
+                else:
+                    st.info("🔍 **Tryb Audytu JST:** Nie wykryto wpisów w tej samej klasyfikacji wymagających sumowania.")
+
+            if stats['sanitized_chars'] > 0:
+                st.warning(f"🧹 Usunięto **{stats['sanitized_chars']}** znaków specjalnych niedozwolonych przez standard XML 1.0.")
+                with st.expander("Zlokalizowane w:"):
+                    for detail in list(stats['sanitized_details'])[:5]: st.write(f"- {detail}")
+
+            if stats['skipped_zeros'] > 0: 
+                st.info(f"ℹ️ Zoptymalizowano (zsumowano do 0.00 lub pominięto): {stats['skipped_zeros']} pozycji.")
+                
+            st.divider()
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button("📦 Pobierz paczkę ZIP", z_buf.getvalue(), 
+                                   f"Eksport_Rekord_{d_date.strftime('%Y%m%d')}.zip", "application/zip", use_container_width=True)
+            
+            with st.expander("🔍 Podgląd pierwszego wygenerowanego dokumentu XML"): st.code(preview, "xml")
+            
+            st.caption(f"⏱️ Czas generowania: {round(time.time() - start_time, 2)} s | Wczytano i przetworzono {len(df)} wierszy źródłowych.")
+                
+        except Exception as e: st.error(f"Błąd krytyczny aplikacji: {e}")
+
+# DODANO: Obsługa widoku dla zakładki Narzędzi PDF
+with tab2:
+    st.write("Wgraj dokumenty (np. wygenerowane z systemu PDF-y z planami jednostek). Aplikacja przygotuje jeden gotowy plik do puszczenia na drukarkę, ułożony w optymalnej kolejności.")
+    
+    wgrane_pliki_pdf = st.file_uploader("Wybierz pliki PDF jednostek", type="pdf", accept_multiple_files=True)
+
+    if wgrane_pliki_pdf:
+        # Sortowanie alfabetyczne by utrzymać stałą kolejność
+        wgrane_pliki_pdf = sorted(wgrane_pliki_pdf, key=lambda x: x.name)
+        
+        # Wyświetlenie listy wgranych plików dla pewności użytkownika
+        with st.expander("Zestawienie załadowanych plików"):
+            for pdf_file in wgrane_pliki_pdf:
+                st.text(pdf_file.name)
+                
+        if st.button("Generuj pojedynczy plik do druku", type="primary"):
+            with st.spinner("Trwa sklejanie stron i wstawianie znaku wodnego..."):
+                try:
+                    gotowy_bufor = generuj_pdf_z_kopiami(wgrane_pliki_pdf)
+                    st.success("🎉 Plik zbiorczy został pomyślnie wygenerowany!")
+                    
+                    st.download_button(
+                        label="⬇️ Pobierz plik do druku (Oryginały + Kopie)",
+                        data=gotowy_bufor,
+                        file_name=f"wydruk_zbiorczy_{datetime.today().strftime('%Y%m%d_%H%M')}.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"Wystąpił błąd podczas scalania: {e}")
