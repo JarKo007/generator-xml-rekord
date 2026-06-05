@@ -8,7 +8,7 @@ import re
 import unicodedata
 import hashlib
 import time
-import fitz  # DODANO: PyMuPDF do obsługi PDF
+import fitz  
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
@@ -275,18 +275,16 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
         
     return re.sub(r'<\?xml[^>]+\?>', '<?xml version="1.0" encoding="UTF-8"?>', xml_str)
 
-# --- DODANO: FUNKCJA DO SCALANIA PDF ---
+# --- FUNKCJA DO SCALANIA PDF ---
 def generuj_pdf_z_kopiami(lista_plikow):
     master_doc = fitz.open()
 
-    # Faza 1: Scalanie oryginałów
     for plik in lista_plikow:
         plik.seek(0)
         doc_oryginal = fitz.open("pdf", plik.read())
         master_doc.insert_pdf(doc_oryginal)
         doc_oryginal.close()
 
-    # Faza 2: Generowanie i scalanie kopii
     for plik in lista_plikow:
         plik.seek(0)
         doc_kopia = fitz.open("pdf", plik.read())
@@ -298,7 +296,7 @@ def generuj_pdf_z_kopiami(lista_plikow):
             strona.insert_text(
                 point=pozycja_naglowka,
                 text="KOPIA",
-                fontsize=18,
+                fontsize=15,  # Zmniejszono z 18 na 15 (ok. -15%)
                 color=(0.6, 0.6, 0.6),
                 fontname="helv",
                 overlay=True
@@ -314,6 +312,15 @@ def generuj_pdf_z_kopiami(lista_plikow):
     bufor_wyjsciowy.seek(0)
     return bufor_wyjsciowy
 
+# --- KLUCZ SORTOWANIA NATURALNEGO ---
+def klucz_sortowania_naturalnego(plik):
+    """
+    Pozwala na poprawne sortowanie plików zawierających liczby, np.:
+    Plik_1.pdf, Plik_2.pdf ... Plik_10.pdf
+    (standardowe sortowanie postawiłoby 10 przed 2)
+    """
+    return [int(tekst) if tekst.isdigit() else tekst.lower() for tekst in re.split(r'(\d+)', plik.name)]
+
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Narzędzia Budżetowe Rekord", layout="wide")
 
@@ -322,7 +329,7 @@ d_date = st.sidebar.date_input("Data dokumentu", datetime.today())
 d_nr = st.sidebar.text_input("Numer", "ZMIANA/2026/01")
 
 d_opis = st.sidebar.text_input("Opis dokumentu", "Zmiana planu finansowego", help="Ogólny opis dokumentu.")
-d_uzas = st.sidebar.text_area("Uzasadnienie (domyślne)", "Wprowadzenie zmian w planie finansowym", help="Zostanie wygenerowane w osobnym pliku TXT dla księgowości oraz doklejone do opisu głównego w XML.")
+d_uzas = st.sidebar.text_area("Uzasadnienie (domyślne)", "Wprowadzenie zmian w planie finansowym", help="Zostanie doklejone do opisu głównego w XML, jeśli w pliku brakuje pola Uzasadnienie.")
 
 st.sidebar.header("⚙️ Ustawienia Księgowe")
 
@@ -359,7 +366,6 @@ d_params = {'nr_dok': d_nr, 'data_dok': d_date.strftime("%Y-%m-%d"),
 
 st.title("🚀 Narzędzia Budżetowe Rekord SI")
 
-# DODANO: Zakładki organizujące aplikację
 tab1, tab2 = st.tabs(["📊 Generator XML z Excela", "🖨️ Przygotowanie Wydruków PDF (Oryginał + Kopia)"])
 
 with tab1:
@@ -475,20 +481,19 @@ with tab1:
                 for unit in units:
                     u_df = df_valid[df_valid['Jednostka_clean'] == unit]
                     
-                    unit_uzas = ""
+                    # Generowanie tekstu wyłączenie do pliku zbiorczego TXT
+                    unit_uzas_txt = "* Brak uzasadnienia *"
                     if 'Uzasadnienie' in u_df.columns:
                         uzas_list = u_df['Uzasadnienie'].fillna('').astype(str).str.strip()
                         valid_uzas = [str(u) for u in uzas_list.unique() if str(u).lower() not in ['nan', 'none', '']]
                         if valid_uzas:
-                            unit_uzas = " | ".join(valid_uzas)
+                            unit_uzas_txt = " | ".join(valid_uzas)
                     
-                    if not unit_uzas:
-                        unit_uzas = d_uzas
-                    
-                    uzasadnienia_raport.append(f"[{unit}]:\n{unit_uzas}\n")
+                    uzasadnienia_raport.append(f"[{unit}]:\n{unit_uzas_txt}\n")
                     
                     for t in sorted(x for x in u_df['Typ_DW_norm'].unique() if x in ['Dochody', 'Wydatki']):
                         sub = u_df[u_df['Typ_DW_norm'] == t].reset_index(drop=True)
+                        # XML korzysta z d_params['uzasadnienie'] z lewego paska jeśli w excelu było puste
                         xml = create_xml(sub, d_params, unit, mapping, t, stats, typ_zmiany_opcja, podstawa_opcja)
                         if not xml: continue 
                         if not preview: preview = xml
@@ -569,18 +574,16 @@ with tab1:
                 
         except Exception as e: st.error(f"Błąd krytyczny aplikacji: {e}")
 
-# DODANO: Obsługa widoku dla zakładki Narzędzi PDF
 with tab2:
     st.write("Wgraj dokumenty (np. wygenerowane z systemu PDF-y z planami jednostek). Aplikacja przygotuje jeden gotowy plik do puszczenia na drukarkę, ułożony w optymalnej kolejności.")
     
     wgrane_pliki_pdf = st.file_uploader("Wybierz pliki PDF jednostek", type="pdf", accept_multiple_files=True)
 
     if wgrane_pliki_pdf:
-        # Sortowanie alfabetyczne by utrzymać stałą kolejność
-        wgrane_pliki_pdf = sorted(wgrane_pliki_pdf, key=lambda x: x.name)
+        # Zastosowanie sortowania naturalnego, aby MP10 było po MP9, a nie po MP1
+        wgrane_pliki_pdf = sorted(wgrane_pliki_pdf, key=klucz_sortowania_naturalnego)
         
-        # Wyświetlenie listy wgranych plików dla pewności użytkownika
-        with st.expander("Zestawienie załadowanych plików"):
+        with st.expander("Zestawienie załadowanych plików (Kolejność wydruku)"):
             for pdf_file in wgrane_pliki_pdf:
                 st.text(pdf_file.name)
                 
