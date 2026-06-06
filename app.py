@@ -276,34 +276,37 @@ def create_xml(data_frame, doc_params, unit_name, mapping_dict, typ_str, stats, 
     return re.sub(r'<\?xml[^>]+\?>', '<?xml version="1.0" encoding="UTF-8"?>', xml_str)
 
 # --- FUNKCJA DO SCALANIA PDF ---
-def generuj_pdf_z_kopiami(lista_plikow):
+def generuj_pdf_z_kopiami(lista_plikow, dodaj_kopie=True):
     master_doc = fitz.open()
 
+    # Faza 1: Scalanie oryginałów
     for plik in lista_plikow:
         plik.seek(0)
         doc_oryginal = fitz.open("pdf", plik.read())
         master_doc.insert_pdf(doc_oryginal)
         doc_oryginal.close()
 
-    for plik in lista_plikow:
-        plik.seek(0)
-        doc_kopia = fitz.open("pdf", plik.read())
-        
-        for strona in doc_kopia:
-            szerokosc_strony = strona.rect.width
-            pozycja_naglowka = fitz.Point(szerokosc_strony - 100, 40)
+    # Faza 2: Generowanie i scalanie kopii (uruchamiana tylko, gdy zaznaczono checkbox)
+    if dodaj_kopie:
+        for plik in lista_plikow:
+            plik.seek(0)
+            doc_kopia = fitz.open("pdf", plik.read())
             
-            strona.insert_text(
-                point=pozycja_naglowka,
-                text="KOPIA",
-                fontsize=15,  # Zmniejszono z 18 na 15 (ok. -15%)
-                color=(0.6, 0.6, 0.6),
-                fontname="helv",
-                overlay=True
-            )
-            
-        master_doc.insert_pdf(doc_kopia)
-        doc_kopia.close()
+            for strona in doc_kopia:
+                szerokosc_strony = strona.rect.width
+                pozycja_naglowka = fitz.Point(szerokosc_strony - 100, 40)
+                
+                strona.insert_text(
+                    point=pozycja_naglowka,
+                    text="KOPIA",
+                    fontsize=15,
+                    color=(0.6, 0.6, 0.6),
+                    fontname="helv",
+                    overlay=True
+                )
+                
+            master_doc.insert_pdf(doc_kopia)
+            doc_kopia.close()
 
     bufor_wyjsciowy = io.BytesIO()
     master_doc.save(bufor_wyjsciowy)
@@ -577,10 +580,13 @@ with tab1:
 with tab2:
     st.write("Wgraj dokumenty (np. wygenerowane z systemu PDF-y z planami jednostek). Aplikacja przygotuje jeden gotowy plik do puszczenia na drukarkę, ułożony w optymalnej kolejności.")
     
+    # DODANO: Checkbox do sterowania kopiami (domyślnie zaznaczony)
+    drukuj_kopie = st.checkbox("Dołącz drugi egzemplarz z napisem 'KOPIA'", value=True)
+    
     wgrane_pliki_pdf = st.file_uploader("Wybierz pliki PDF jednostek", type="pdf", accept_multiple_files=True)
 
     if wgrane_pliki_pdf:
-        # Zastosowanie sortowania naturalnego, aby MP10 było po MP9, a nie po MP1
+        # Zastosowanie sortowania naturalnego
         wgrane_pliki_pdf = sorted(wgrane_pliki_pdf, key=klucz_sortowania_naturalnego)
         
         with st.expander("Zestawienie załadowanych plików (Kolejność wydruku)"):
@@ -588,15 +594,19 @@ with tab2:
                 st.text(pdf_file.name)
                 
         if st.button("Generuj pojedynczy plik do druku", type="primary"):
-            with st.spinner("Trwa sklejanie stron i wstawianie znaku wodnego..."):
+            with st.spinner("Trwa przygotowywanie pliku..."):
                 try:
-                    gotowy_bufor = generuj_pdf_z_kopiami(wgrane_pliki_pdf)
+                    # Przekazanie decyzji z checkboxa do funkcji
+                    gotowy_bufor = generuj_pdf_z_kopiami(wgrane_pliki_pdf, dodaj_kopie=drukuj_kopie)
                     st.success("🎉 Plik zbiorczy został pomyślnie wygenerowany!")
                     
+                    # Dostosowanie nazwy pliku na podstawie checkboxa
+                    typ_pliku = "z_kopiami" if drukuj_kopie else "tylko_oryginaly"
+                    
                     st.download_button(
-                        label="⬇️ Pobierz plik do druku (Oryginały + Kopie)",
+                        label="⬇️ Pobierz plik do druku",
                         data=gotowy_bufor,
-                        file_name=f"wydruk_zbiorczy_{datetime.today().strftime('%Y%m%d_%H%M')}.pdf",
+                        file_name=f"wydruk_zbiorczy_{typ_pliku}_{datetime.today().strftime('%Y%m%d_%H%M')}.pdf",
                         mime="application/pdf"
                     )
                 except Exception as e:
